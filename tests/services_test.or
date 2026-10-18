@@ -1,0 +1,62 @@
+import { assert, assertEq, assertEqString, assertEqBool } from "std:test";
+import { Host, withFs, withClock } from "std:host";
+import { scopeFs, scopeClock } from "std:task";
+import { startClock, startRandom, fixedClock, constantRandom, failingRandom } from "../src/module";
+
+@Test
+function randomServiceGivesDistinctBytes(host: Host): void {
+  withFs(host, fs => scopeFs(fs, (s, g) => {
+    const rnd = startRandom(s, g);
+    const a = rnd.bytes(32).unwrap();
+    const b = rnd.bytes(32).unwrap();
+    assertEq(a.length().toInt(), 32, "length");
+    assertEqBool(a.equals(b), false, "two draws differ");
+    assertEq(rnd.bytes(0).unwrap().length().toInt(), 0, "zero");
+    assert(rnd.bytes(5000).isErr(), "too large");
+    rnd.stop();
+  }));
+}
+
+@Test
+function randomServiceIsNotAllZeroOrConstant(host: Host): void {
+  withFs(host, fs => scopeFs(fs, (s, g) => {
+    const rnd = startRandom(s, g);
+    const a = rnd.bytes(64).unwrap().toArray();
+    let distinct: int = 0;
+    let seen: bool[] = [];
+    let i: usize = 0;
+    while (i < 256) { seen.push(false); i += 1; }
+    for (const x of a) {
+      if (!seen[x.toUsize()]) { seen[x.toUsize()] = true; distinct += 1; }
+    }
+    assert(distinct > 20, "64 random bytes have many distinct values");
+    rnd.stop();
+  }));
+}
+
+@Test
+function stoppedRandomServiceFailsInsteadOfGuessing(host: Host): void {
+  withFs(host, fs => scopeFs(fs, (s, g) => {
+    const rnd = startRandom(s, g);
+    rnd.stop();
+    assert(rnd.bytes(8).isErr(), "no entropy after stop");
+  }));
+}
+
+@Test
+function clockServiceReadsTheWallClock(host: Host): void {
+  withClock(host, clock => scopeClock(clock, (s, g) => {
+    const c = startClock(s, g);
+    const t = c.now();
+    assert(t > 1700000000000, "after 2023");
+    assert(c.now() >= t, "not backwards");
+    c.stop();
+  }));
+}
+
+@Test
+function testDoubles(): void {
+  assertEq(fixedClock(42)(), 42, "fixed clock");
+  assertEq(constantRandom(7)(3).unwrap().at(2).toInt(), 7, "constant random");
+  assert(failingRandom()(3).isErr(), "failing random");
+}

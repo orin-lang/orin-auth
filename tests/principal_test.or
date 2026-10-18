@@ -1,0 +1,47 @@
+import { assert, assertEq, assertEqString, assertEqBool } from "std:test";
+import { Get } from "std:http";
+import { testRequest } from "orin-web";
+import {
+  Principal, ViaSession, ViaJwt, newPrincipal, hasRole, hasScope, hasAnyRole, hasAllScopes, withPrincipal, withoutPrincipal,
+  principalOf, authMethodName,
+} from "../src/module";
+
+@Test
+function principalRoundTripsThroughARequest(): void {
+  const p = newPrincipal("user|1,é", ["admin", "a b"], ["deploy", "read:x"], ViaJwt);
+  const req = withPrincipal(testRequest(Get, "/"), p);
+  const back = principalOf(req).unwrap();
+  assertEqString(back.subject, "user|1,é", "subject survives separators");
+  assert(back.roles == ["admin", "a b"], "roles");
+  assert(back.scopes == ["deploy", "read:x"], "scopes");
+  assertEqString(authMethodName(back.method), "jwt", "method");
+}
+
+@Test
+function anonymousRequestHasNoPrincipal(): void {
+  assert(principalOf(testRequest(Get, "/")).isNone(), "none");
+  const req = withoutPrincipal(withPrincipal(testRequest(Get, "/"), newPrincipal("a", [], [], ViaSession)));
+  assert(principalOf(req).isNone(), "cleared");
+}
+
+@Test
+function emptyListsStayEmpty(): void {
+  const req = withPrincipal(testRequest(Get, "/"), newPrincipal("a", [], [], ViaSession));
+  const back = principalOf(req).unwrap();
+  assertEq(back.roles.length.toInt(), 0, "no roles");
+  assertEq(back.scopes.length.toInt(), 0, "no scopes");
+}
+
+@Test
+function roleAndScopeChecks(): void {
+  const p = newPrincipal("a", ["admin", "dev"], ["deploy", "read"], ViaSession);
+  assertEqBool(hasRole(p, "admin"), true, "role");
+  assertEqBool(hasRole(p, "Admin"), false, "case-sensitive");
+  assertEqBool(hasScope(p, "deploy"), true, "scope");
+  assertEqBool(hasScope(p, "deplo"), false, "exact");
+  assertEqBool(hasAnyRole(p, ["x", "dev"]), true, "any");
+  assertEqBool(hasAnyRole(p, []), false, "any of none");
+  assertEqBool(hasAllScopes(p, ["deploy", "read"]), true, "all");
+  assertEqBool(hasAllScopes(p, ["deploy", "write"]), false, "not all");
+  assertEqBool(hasAllScopes(p, []), true, "all of none");
+}

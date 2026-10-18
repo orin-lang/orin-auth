@@ -1,0 +1,7 @@
+[package]
+name = "orin-auth"
+version = "0.1.0"
+entry = "src/module.or"
+
+[dependencies]
+orin-web = { git = "https://github.com/orin-lang/orin-web", rev = "fb8ef8b3cddd2414c54467de515a0330f1a3f9a6" }
