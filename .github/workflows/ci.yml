@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The Orin toolchain is built from this orin-lang commit (the one this library is developed against). Bump it deliberately.
+  ORIN_LANG_REF: fbe4c181e8669c3cd8faf278206a039e95afe6e9
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: orin-lang/orin-lang
+          ref: ${{ env.ORIN_LANG_REF }}
+          path: orin-lang
+      - name: Restore the Orin toolchain
+        id: toolchain
+        uses: actions/cache@v4
+        with:
+          path: orin-lang/build
+          key: orin-toolchain-${{ runner.os }}-${{ env.ORIN_LANG_REF }}
+      - name: Build the Orin toolchain (tools/orin builds the dev CLI from the seed)
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: orin-lang/tools/orin --version
+      - name: Check
+        run: |
+          # tools/orin rebuilds only when its inputs changed; with the restored build it is a no-op.
+          echo "ORIN=$PWD/orin-lang/tools/orin" >> "$GITHUB_ENV"
+      - name: orin-auth tests, example and formatting
+        run: tools/ci.sh

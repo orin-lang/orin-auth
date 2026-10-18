@@ -68,3 +68,14 @@ export {
   OidcTxnStore, MemoryOidcTxnStore, LoginStart, OIDC_TXN_SECONDS, pkceChallenge, beginLogin,
   OidcIdentity, IdTokenValidator, jwtIdTokenValidator, tokenRequest, completeLogin,
 } from "./oidc";
+
+// The orin-web names an application needs next to orin-auth, re-exported so that an application can depend on orin-auth ALONE. Two
+// declarations of the same orin-web (one direct, one through orin-auth) are two different packages to the compiler and their
+// `Request` types do not match, so an application that also lists orin-web gets E0400 errors. See docs/security.md, "Known limits".
+export {
+  Router, Request, Response, WebError, Handler, Middleware, withMiddleware, chain, jsonObject,
+  jsonMember, jsonString, jsonInt, jsonBool, jsonArray, badRequest, unauthorized, forbidden,
+  notFound, internalError, statusError, logger, cors, defaultCors, TestClient, testRequest,
+  assertStatus, assertBody, assertHeader, ServerConfig, ServerHandle, defaultServerConfig, serve,
+  Middlewares, newMiddlewares, WebErrorKind,
+} from "orin-web";

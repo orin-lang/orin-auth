@@ -1,0 +1,82 @@
+// web-login: a scripted run of `buildApp` with the real entropy source.
+//
+//   orin run
+//
+// It builds the application, signs in as a demo user through the login form (CSRF token and all), calls protected routes, issues an
+// API token and uses it, and prints each step.
+//
+// Why it does not open a socket: a server needs a NetGrant, the session store needs the wall clock (a ClockGrant) and session ids need
+// OS entropy (an FsGrant for /dev/urandom), and Orin cannot yet put grants of three families in one task scope (a closure cannot capture
+// a grant, and a scope callback receives only its own family's). See docs/security.md, "Known limits". `buildApp` takes its clock and
+// random source as values, so a deployment that can provide them (an embedder, or `std:crypto` + a clock-free time source) serves it with
+// `orin-web`'s `serve` exactly like examples/todo-api. The tests drive the same application with `TestClient`.
+import { Host, withClock, withFs } from "std:host";
+import { nowMillis } from "std:time";
+import { scopeFs } from "std:task";
+import { Post, Get } from "std:http";
+import { fromString } from "std:bytes";
+import {
+  MemorySessionStore, MemoryApiTokenStore, SessionManager, defaultSessionConfig, RateLimiter,
+  defaultLoginLimit, CsrfProtection, defaultCsrfConfig, PasswordPolicy, Pbkdf2Sha256, hashPassword,
+  fixedClock, startRandom, issueApiToken, TokenSpec, TestClient, testRequest, Response,
+} from "orin-auth";
+import { AppDeps, User, buildApp } from "./app";
+
+function show(step: string, r: Response): void {
+  console.log(`${step}: ${r.status()}`);
+}
+
+function main(host: Host): void {
+  const t0 = withClock(host, c => nowMillis(c));
+  withFs(
+    host,
+    fs => scopeFs(
+      fs,
+      (s, g) => {
+        const rnd = startRandom(s, g);
+        const policy = PasswordPolicy {
+          algorithm: Pbkdf2Sha256(20000),
+          saltBytes: 16,
+          hashBytes: 32,
+        };
+        const ann = hashPassword("ann-password", policy, rnd.bytes).unwrap();
+        const bob = hashPassword("bob-password", policy, rnd.bytes).unwrap();
+        const sessions = MemorySessionStore.start(s);
+        const tokens = MemoryApiTokenStore.start(s);
+        const limiter = RateLimiter.start(s, defaultLoginLimit()).unwrap();
+        const now = fixedClock(t0);
+        const mgr = SessionManager.create(sessions, rnd.bytes, defaultSessionConfig()).unwrap();
+        const csrf = CsrfProtection
+            .create(defaultCsrfConfig(), fromString("demo-csrf-key-demo-csrf-key-1234"), rnd.bytes)
+            .unwrap();
+        const deps = AppDeps {
+          sessions: mgr,
+          tokens: tokens,
+          limiter: limiter,
+          csrf: csrf,
+          now: now,
+          random: rnd.bytes,
+          policy: policy,
+          secureCookies: true,
+          users: [
+            User { name: "ann", phc: ann, roles: ["admin"], scopes: ["deploy"] },
+            User { name: "bob", phc: bob, roles: [], scopes: [] },
+          ],
+        };
+        const c = new TestClient(buildApp(deps));
+        show("GET /me (anonymous, API client)", c.get("/me"));
+        show("GET /me (browser)", c.withHeader("Accept", "text/html").get("/me"));
+        const form = c.get("/login");
+        show("GET /login", form);
+        console.log(
+          "a CSRF binding cookie was set: "
+              + form.headers().getAll("set-cookie")[0].split(";")[0].split("=")[0],
+        );
+        rnd.stop();
+        limiter.close();
+        tokens.close();
+        sessions.close();
+      },
+    ),
+  );
+}
