@@ -1,0 +1,149 @@
+// Authorization middleware: 401 / 403 / redirect decisions from the request's `Principal`.
+//
+//   app.use(authenticate([...], now));                       // who is it?       (authn.or)
+//   admin.use(requireRole(defaultAuthzConfig(), "admin"));   // may they?        (this file)
+//
+// 401 means "I do not know who you are": no principal. 403 means "I know, and the answer is no": a principal without the role or
+// scope. How each is shown is configuration (`DenyMode`):
+//   DenyJson                  `Err(WebError)`: the router's error handler renders it, JSON by default; 401 carries
+//                             `WWW-Authenticate: <challenge>` when the config names one.
+//   DenyRedirect(url)         303 to `url` (for 401, with `?next=<the path asked for>` on GET). For HTML pages.
+//   DenyByAccept(url)         a redirect when the client prefers HTML (`Accept` mentions text/html) and the method is GET / HEAD,
+//                             JSON otherwise. One setting for an app with pages and an API.
+import { PercentSpace, percentEncode } from "std:url";
+import { Method, Get, Head, toLowerAscii, methodName } from "std:http";
+import { Request, Response, WebError, Handler, Middleware, unauthorized, forbidden, withErrorHeader } from "orin-web";
+import { Principal, principalOf, hasRole, hasScope, hasAnyRole, hasAllScopes } from "./principal";
+
+export type DenyMode = DenyJson | DenyRedirect(string) | DenyByAccept(string);
+
+// challenge: the `WWW-Authenticate` value of a JSON 401 ("Bearer" for an API, "" for none).
+export type AuthzConfig = { unauthenticated: DenyMode; forbidden: DenyMode; challenge: string; };
+
+// defaultAuthzConfig(): AuthzConfig -- JSON for both, challenge "Bearer". Right for an API.
+export function defaultAuthzConfig(): AuthzConfig {
+  return AuthzConfig { unauthenticated: DenyJson, forbidden: DenyJson, challenge: "Bearer" };
+}
+
+// pagesAuthzConfig(loginUrl): AuthzConfig -- unauthenticated browsers go to `loginUrl?next=..`, a 403 stays a 403. Right for a
+// server-rendered site.
+export function pagesAuthzConfig(loginUrl: string): AuthzConfig {
+  return AuthzConfig { unauthenticated: DenyRedirect(loginUrl), forbidden: DenyJson, challenge: "" };
+}
+
+// mixedAuthzConfig(loginUrl): AuthzConfig -- redirects browsers asking for HTML, answers JSON to everything else.
+export function mixedAuthzConfig(loginUrl: string): AuthzConfig {
+  return AuthzConfig { unauthenticated: DenyByAccept(loginUrl), forbidden: DenyJson, challenge: "Bearer" };
+}
+
+// safeNext(next, fallback): string -- `next` when it is a same-site path ("/orders?id=3"), else `fallback`. Use it on the `next`
+// parameter of the login page before redirecting after login: an open redirect ("//evil.example", "/\evil.example",
+// "https://evil.example", control characters) is refused.
+export function safeNext(next: string, fallback: string): string {
+  if (next.length == 0 || !next.startsWith("/") || next.startsWith("//") || next.startsWith("/\\")) {
+    return fallback;
+  }
+  let i: usize = 0;
+  while (i < next.length) {
+    const c = next.charCodeAt(i).toInt();
+    if (c < 32 || c == 127 || c == 92) {
+      return fallback;
+    }
+    i += 1;
+  }
+  return next;
+}
+
+function wantsHtml(req: Request): bool {
+  const a = req.header("accept");
+  return a.isSome() && toLowerAscii(a.unwrap()).includes("text/html");
+}
+
+function isRead(req: Request): bool {
+  const m = methodName(req.method());
+  return m == "GET" || m == "HEAD";
+}
+
+function redirectTo(url: string, req: Request, withNext: bool): Result<Response, WebError> {
+  let location = url;
+  if (withNext && isRead(req)) {
+    location = url + (url.includes("?") ? "&" : "?") + "next=" + percentEncode(req.target(), PercentSpace);
+  }
+  return Response.redirect(303, location);
+}
+
+// The redirect target of a denial mode for this request, if it redirects.
+function redirectFor(mode: DenyMode, req: Request): Option<string> {
+  return match (mode) {
+    DenyJson => None,
+    DenyRedirect(url) => Some(url),
+    DenyByAccept(url) => wantsHtml(req) && isRead(req) ? Some(url) : None,
+  };
+}
+
+function deny401(cfg: AuthzConfig, req: Request): Result<Response, WebError> {
+  const redirect = redirectFor(cfg.unauthenticated, req);
+  if (redirect.isSome()) {
+    return redirectTo(redirect.unwrap(), req, true);
+  }
+  const e = unauthorized("authentication required");
+  return Err(cfg.challenge.length > 0 ? withErrorHeader(e, "WWW-Authenticate", cfg.challenge) : e);
+}
+
+function deny403(cfg: AuthzConfig, req: Request): Result<Response, WebError> {
+  const redirect = redirectFor(cfg.forbidden, req);
+  if (redirect.isSome()) {
+    return redirectTo(redirect.unwrap(), req, false);
+  }
+  return Err(forbidden("insufficient permissions"));
+}
+
+// requirePrincipal(cfg, allowed): Middleware -- 401 without a principal, 403 when `allowed(principal)` is false. The building block
+// of the others; use it for rules of your own ("owner or admin").
+export function requirePrincipal(cfg: AuthzConfig, allowed: (p: Principal) => bool): Middleware {
+  return (req: Request, next: Handler): Result<Response, WebError> => {
+    const p = principalOf(req);
+    if (p.isNone()) {
+      return deny401(cfg, req);
+    }
+    if (!allowed(p.unwrap())) {
+      return deny403(cfg, req);
+    }
+    return next(req);
+  };
+}
+
+// requireAuthenticated(cfg): Middleware -- any principal.
+export function requireAuthenticated(cfg: AuthzConfig): Middleware {
+  return requirePrincipal(cfg, (p: Principal): bool => true);
+}
+
+// requireRole(cfg, role): Middleware -- the principal has this role.
+export function requireRole(cfg: AuthzConfig, role: string): Middleware {
+  return requirePrincipal(cfg, (p: Principal): bool => hasRole(p, role));
+}
+
+// requireAnyRole(cfg, roles): Middleware -- the principal has at least one of the roles.
+export function requireAnyRole(cfg: AuthzConfig, roles: string[]): Middleware {
+  return requirePrincipal(cfg, (p: Principal): bool => hasAnyRole(p, roles));
+}
+
+// requireScope(cfg, scope): Middleware -- the principal has this scope.
+export function requireScope(cfg: AuthzConfig, scope: string): Middleware {
+  return requirePrincipal(cfg, (p: Principal): bool => hasScope(p, scope));
+}
+
+// requireAllScopes(cfg, scopes): Middleware -- the principal has every one of the scopes.
+export function requireAllScopes(cfg: AuthzConfig, scopes: string[]): Middleware {
+  return requirePrincipal(cfg, (p: Principal): bool => hasAllScopes(p, scopes));
+}
+
+// currentPrincipal(req): Result<Principal, WebError> -- for a handler that needs the caller: `const me = currentPrincipal(req)?;`
+// answers 401 when there is none (the route was not protected by middleware, or the middleware was misplaced).
+export function currentPrincipal(req: Request): Result<Principal, WebError> {
+  const p = principalOf(req);
+  if (p.isNone()) {
+    return Err(unauthorized("authentication required"));
+  }
+  return Ok(p.unwrap());
+}

@@ -1,0 +1,232 @@
+import { assert, assertEq, assertEqString, assertEqBool, fail } from "std:test";
+import { Get, Post } from "std:http";
+import { scope } from "std:task";
+import {
+  Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertBody, assertHeader, assertNoHeader,
+  withMiddleware, internalError,
+} from "orin-web";
+import {
+  MemorySessionStore, SessionManager, defaultSessionConfig, countingRandom, fixedClock, Authenticator, AuthOutcome, AuthAnonymous,
+  AuthPassed, AuthFailed, noExtras, authenticate, sessionAuthenticator, Principal, ViaJwt, ViaApiToken, principalOf, newPrincipal,
+  requireAuthenticated, requireRole, requireAnyRole, requireScope, requireAllScopes, requirePrincipal, defaultAuthzConfig,
+  pagesAuthzConfig, mixedAuthzConfig, AuthzConfig, DenyRedirect, DenyJson, safeNext, currentPrincipal, hasRole,
+} from "../src/module";
+
+// A fake authenticator: the header X-Test-User: name:role1+role2:scope1+scope2 authenticates; X-Test-Bad rejects.
+function fakeAuth(req: Request, now: int): AuthOutcome {
+  if (req.header("x-test-bad").isSome()) {
+    return AuthFailed("bad credential", "Bearer error=\"invalid_token\"");
+  }
+  const h = req.header("x-test-user");
+  if (h.isNone()) {
+    return AuthAnonymous;
+  }
+  const parts = h.unwrap().split(":");
+  let roles: string[] = [];
+  if (parts.length > 1 && parts[1].length > 0) {
+    roles = parts[1].split("+");
+  }
+  let scopes: string[] = [];
+  if (parts.length > 2 && parts[2].length > 0) {
+    scopes = parts[2].split("+");
+  }
+  return AuthPassed(newPrincipal(parts[0], roles, scopes, ViaJwt), noExtras());
+}
+
+function ok(req: Request): Result<Response, WebError> {
+  const p = principalOf(req);
+  return Ok(Response.text(200, p.isSome() ? "hello " + p.unwrap().subject : "hello anonymous"));
+}
+
+function appWith(cfg: AuthzConfig): Router {
+  let app = new Router();
+  app.use(authenticate([fakeAuth], fixedClock(1000)));
+  app.get("/public", ok);
+  app.get("/me", withMiddleware(requireAuthenticated(cfg), ok));
+  app.get("/admin", withMiddleware(requireRole(cfg, "admin"), ok));
+  app.get("/either", withMiddleware(requireAnyRole(cfg, ["admin", "ops"]), ok));
+  app.post("/deploy", withMiddleware(requireScope(cfg, "deploy"), ok));
+  app.post("/both", withMiddleware(requireAllScopes(cfg, ["read", "write"]), ok));
+  return app;
+}
+
+function user(c: TestClient, spec: string): TestClient {
+  return c.withHeader("X-Test-User", spec);
+}
+
+@Test
+function publicRoutesNeedNothing(): void {
+  const c = new TestClient(appWith(defaultAuthzConfig()));
+  assertBody(c.get("/public"), "hello anonymous");
+  assertBody(user(c, "ann").get("/public"), "hello ann");
+}
+
+@Test
+function missingPrincipalIs401WithAChallenge(): void {
+  const c = new TestClient(appWith(defaultAuthzConfig()));
+  const r = c.get("/me");
+  assertStatus(r, 401);
+  assertHeader(r, "WWW-Authenticate", "Bearer");
+  assert(r.bodyText().includes("\"status\":401"), "json body");
+  assertBody(user(c, "ann").get("/me"), "hello ann");
+}
+
+@Test
+function missingRoleIs403NotRedirectNot401(): void {
+  const c = new TestClient(appWith(defaultAuthzConfig()));
+  assertStatus(user(c, "ann:dev").get("/admin"), 403);
+  assertStatus(user(c, "ann:admin").get("/admin"), 200);
+  assertStatus(c.get("/admin"), 401);
+}
+
+@Test
+function anyRoleAndScopeRules(): void {
+  const c = new TestClient(appWith(defaultAuthzConfig()));
+  assertStatus(user(c, "a:ops").get("/either"), 200);
+  assertStatus(user(c, "a:dev").get("/either"), 403);
+  assertStatus(c.send(testRequest(Post, "/deploy")), 401);
+  assertStatus(user(c, "a::deploy").send(testRequest(Post, "/deploy")), 200);
+  assertStatus(user(c, "a::deplo").send(testRequest(Post, "/deploy")), 403);
+  assertStatus(user(c, "a::read").send(testRequest(Post, "/both")), 403);
+  assertStatus(user(c, "a::read+write").send(testRequest(Post, "/both")), 200);
+}
+
+@Test
+function roleDoesNotImplyScope(): void {
+  const c = new TestClient(appWith(defaultAuthzConfig()));
+  assertStatus(user(c, "root:admin").send(testRequest(Post, "/deploy")), 403);
+}
+
+@Test
+function aBadCredentialIs401EvenOnPublicRoutes(): void {
+  const c = new TestClient(appWith(defaultAuthzConfig()));
+  const r = c.withHeader("X-Test-Bad", "1").get("/public");
+  assertStatus(r, 401);
+  assertHeader(r, "WWW-Authenticate", "Bearer error=\"invalid_token\"");
+}
+
+@Test
+function pagesRedirectToLoginWithNext(): void {
+  const c = new TestClient(appWith(pagesAuthzConfig("/login")));
+  const r = c.get("/me");
+  assertStatus(r, 303);
+  assertHeader(r, "Location", "/login?next=%2Fme");
+  assertNoHeader(r, "WWW-Authenticate");
+  assertStatus(user(c, "a:dev").get("/admin"), 403);
+}
+
+@Test
+function nextIsOnlyAddedForReadsAndKeepsTheQuery(): void {
+  const c = new TestClient(appWith(pagesAuthzConfig("/login?lang=de")));
+  assertHeader(c.get("/me?x=1&y=2"), "Location", "/login?lang=de&next=%2Fme%3Fx%3D1%26y%3D2");
+  const post = c.send(testRequest(Post, "/deploy"));
+  assertStatus(post, 303);
+  assertHeader(post, "Location", "/login?lang=de");
+}
+
+@Test
+function mixedModeRedirectsBrowsersAndAnswersJsonToApis(): void {
+  const c = new TestClient(appWith(mixedAuthzConfig("/login")));
+  assertStatus(c.withHeader("Accept", "text/html,application/xhtml+xml").get("/me"), 303);
+  assertStatus(c.withHeader("Accept", "application/json").get("/me"), 401);
+  assertStatus(c.get("/me"), 401);
+  assertStatus(c.withHeader("Accept", "text/html").send(testRequest(Post, "/deploy")), 401);
+}
+
+@Test
+function forbiddenCanRedirectToo(): void {
+  const cfg = AuthzConfig { ...pagesAuthzConfig("/login"), forbidden: DenyRedirect("/denied") };
+  const c = new TestClient(appWith(cfg));
+  const r = user(c, "a:dev").get("/admin");
+  assertStatus(r, 303);
+  assertHeader(r, "Location", "/denied");
+}
+
+@Test
+function customRules(): void {
+  let app = new Router();
+  app.use(authenticate([fakeAuth], fixedClock(1000)));
+  const ownerOrAdmin = requirePrincipal(defaultAuthzConfig(), (p: Principal): bool => p.subject == "owner" || hasRole(p, "admin"));
+  app.get("/doc", withMiddleware(ownerOrAdmin, ok));
+  const c = new TestClient(app);
+  assertStatus(user(c, "owner").get("/doc"), 200);
+  assertStatus(user(c, "x:admin").get("/doc"), 200);
+  assertStatus(user(c, "x").get("/doc"), 403);
+}
+
+@Test
+function clientCannotForgeAPrincipal(): void {
+  // Attributes are server-side only: no header or query value becomes the principal.
+  const c = new TestClient(appWith(defaultAuthzConfig()));
+  const r = c.withHeader("auth.principal", "jwt|root|admin|deploy").withHeader("X-Auth-Principal", "root").get("/admin");
+  assertStatus(r, 401);
+}
+
+@Test
+function earlierPrincipalIsClearedBeforeAuthenticatorsRun(): void {
+  let app = new Router();
+  // an earlier (buggy or hostile) middleware sets a principal; `authenticate` must not let it stand
+  app.use((req: Request, next: (r: Request) => Result<Response, WebError>): Result<Response, WebError> =>
+    next(req.withAttr("auth.principal", "jwt|root|admin|")));
+  app.use(authenticate([fakeAuth], fixedClock(1000)));
+  app.get("/admin", withMiddleware(requireRole(defaultAuthzConfig(), "admin"), ok));
+  assertStatus(new TestClient(app).get("/admin"), 401);
+}
+
+@Test
+function currentPrincipalForHandlers(): void {
+  let app = new Router();
+  app.use(authenticate([fakeAuth], fixedClock(1000)));
+  app.get("/who", (req: Request): Result<Response, WebError> => {
+    const me = currentPrincipal(req)?;
+    return Ok(Response.text(200, me.subject));
+  });
+  const c = new TestClient(app);
+  assertStatus(c.get("/who"), 401);
+  assertBody(user(c, "ann").get("/who"), "ann");
+}
+
+@Test
+function safeNextRefusesOpenRedirects(): void {
+  assertEqString(safeNext("/orders?id=3", "/"), "/orders?id=3", "path");
+  assertEqString(safeNext("//evil.example", "/"), "/", "protocol-relative");
+  assertEqString(safeNext("/\\evil.example", "/"), "/", "backslash");
+  assertEqString(safeNext("https://evil.example/", "/"), "/", "absolute");
+  assertEqString(safeNext("javascript:alert(1)", "/"), "/", "scheme");
+  assertEqString(safeNext("/a\r\nSet-Cookie: x=y", "/"), "/", "control characters");
+  assertEqString(safeNext("", "/home"), "/home", "empty");
+  assertEqString(safeNext("orders", "/home"), "/home", "relative");
+}
+
+@Test
+function sessionsAuthenticateThroughTheMiddleware(): void {
+  scope(s => {
+    const store = MemorySessionStore.start(s);
+    const rnd = countingRandom(s);
+    const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
+    let app = new Router();
+    app.use(authenticate([sessionAuthenticator(mgr)], fixedClock(5000)));
+    app.post("/login", (req: Request): Result<Response, WebError> => {
+      const made = mgr.login(req, 5000, "ann", ["admin"], []);
+      if (made.isErr()) {
+        return Err(internalError("login failed"));
+      }
+      return Ok(Response.text(200, "in").withAddedHeader("Set-Cookie", made.unwrap().setCookie));
+    });
+    app.get("/admin", withMiddleware(requireRole(defaultAuthzConfig(), "admin"), ok));
+    app.post("/logout", (req: Request): Result<Response, WebError> => {
+      return Ok(Response.text(200, "out").withAddedHeader("Set-Cookie", mgr.logout(req).unwrap()));
+    });
+    const c = new TestClient(app);
+    assertStatus(c.get("/admin"), 401);
+    const login = c.send(testRequest(Post, "/login"));
+    assertStatus(login, 200);
+    const cookie = login.headers().getAll("set-cookie")[0].split(";")[0];
+    const authed = c.withHeader("Cookie", cookie);
+    assertBody(authed.get("/admin"), "hello ann");
+    assertStatus(authed.send(testRequest(Post, "/logout")), 200);
+    assertStatus(authed.get("/admin"), 401);
+    rnd.stop();
+    store.close();
+  });
+}

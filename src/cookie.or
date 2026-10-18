@@ -3,7 +3,7 @@
 import { isToken } from "std:http";
 import { QueryPair } from "std:url";
 import { Request } from "orin-web";
-import { AuthError, authError, InvalidConfig, InvalidInput } from "./error";
+import { AuthError, authError, ConfigInvalid, InputInvalid } from "./error";
 
 export type SameSite = SameSiteLax | SameSiteStrict | SameSiteNone;
 
@@ -81,31 +81,31 @@ function isDomainValue(v: string): bool {
 //   * `__Host-` needs Secure, Path=/ and no Domain; `__Secure-` needs Secure.
 export function checkCookie(name: string, value: string, attrs: CookieAttrs): Result<void, AuthError> {
   if (!isToken(name)) {
-    return Err(authError(InvalidConfig, "cookie name is not a valid token"));
+    return Err(authError(ConfigInvalid, "cookie name is not a valid token"));
   }
   if (!isCookieValue(value)) {
-    return Err(authError(InvalidInput, "cookie value has characters that are not allowed"));
+    return Err(authError(InputInvalid, "cookie value has characters that are not allowed"));
   }
   if (!isPathValue(attrs.path)) {
-    return Err(authError(InvalidConfig, "cookie path must start with / and have no control characters or ;"));
+    return Err(authError(ConfigInvalid, "cookie path must start with / and have no control characters or ;"));
   }
   if (attrs.domain.isSome() && !isDomainValue(attrs.domain.unwrap())) {
-    return Err(authError(InvalidConfig, "cookie domain has characters that are not allowed"));
+    return Err(authError(ConfigInvalid, "cookie domain has characters that are not allowed"));
   }
   const none = match (attrs.sameSite) {
     SameSiteNone => true,
     _ => false,
   };
   if (none && !attrs.secure) {
-    return Err(authError(InvalidConfig, "SameSite=None requires Secure"));
+    return Err(authError(ConfigInvalid, "SameSite=None requires Secure"));
   }
   if (name.startsWith("__Host-")) {
     if (!attrs.secure || attrs.path != "/" || attrs.domain.isSome()) {
-      return Err(authError(InvalidConfig, "a __Host- cookie needs Secure, Path=/ and no Domain"));
+      return Err(authError(ConfigInvalid, "a __Host- cookie needs Secure, Path=/ and no Domain"));
     }
   }
   if (name.startsWith("__Secure-") && !attrs.secure) {
-    return Err(authError(InvalidConfig, "a __Secure- cookie needs Secure"));
+    return Err(authError(ConfigInvalid, "a __Secure- cookie needs Secure"));
   }
   return Ok();
 }

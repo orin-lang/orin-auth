@@ -2,11 +2,11 @@
 // Authentication FAILURES of a request (wrong password, bad token) are not errors of this type: they are `false`, `None` or the
 // specific enumerations of each module (`JwtErrorKind`, `PasswordErrorKind`).
 export type AuthErrorKind =
-  InvalidConfig       // a configuration value that cannot work (empty cookie name, `__Host-` prefix without Secure, ...)
-  | InvalidInput      // an argument the caller got wrong (a role name with a comma, an empty subject, ...)
-  | Entropy           // the random source failed or is not running: nothing was created
-  | Unavailable       // a service task (store, clock, random) is not running
-  | Unsupported;      // a feature that needs `std:crypto` (argon2id, RS256, ES256) or a network client
+  ConfigInvalid       // a configuration value that cannot work (empty cookie name, `__Host-` prefix without Secure, ...)
+  | InputInvalid      // an argument the caller got wrong (a role name with a comma, an empty subject, ...)
+  | EntropyFailed           // the random source failed or is not running: nothing was created
+  | ServiceUnavailable       // a service task (store, clock, random) is not running
+  | FeatureUnsupported;      // a feature that needs `std:crypto` (argon2id, RS256, ES256) or a network client
 
 export type AuthError = { kind: AuthErrorKind; message: string; };
 
@@ -18,11 +18,11 @@ export function authError(kind: AuthErrorKind, message: string): AuthError {
 // token or key into a message.
 export function authErrorMessage(e: AuthError): string {
   const k = match (e.kind) {
-    InvalidConfig => "invalid configuration",
-    InvalidInput => "invalid input",
-    Entropy => "no entropy",
-    Unavailable => "service unavailable",
-    Unsupported => "unsupported",
+    ConfigInvalid => "invalid configuration",
+    InputInvalid => "invalid input",
+    EntropyFailed => "no entropy",
+    ServiceUnavailable => "service unavailable",
+    FeatureUnsupported => "unsupported",
   };
   return k + ": " + e.message;
 }

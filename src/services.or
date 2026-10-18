@@ -19,12 +19,14 @@
 // session ids or tokens themselves.
 //
 // Randomness comes from /dev/urandom (the kernel CSPRNG, never blocks once seeded). On a platform without it `startRandom`'s
-// function returns `Err(Entropy)` and orin-auth refuses to create ids: it never falls back to a weaker source.
+// function returns `Err(EntropyFailed)` and orin-auth refuses to create ids: it never falls back to a weaker source.
 import { Bytes, fromString, fromArray, empty } from "std:bytes";
 import { Scope, Sender, Receiver, channel, spawnFs, spawnClock } from "std:task";
 import { FsGrant, File, Read, withFile } from "std:fs";
 import { ClockGrant, nowMillis } from "std:time";
-import { AuthError, authError, Entropy, Unavailable, InvalidInput } from "./error";
+import { AuthError, authError, EntropyFailed, ServiceUnavailable, InputInvalid } from "./error";
+import { KvHandle, startKv } from "./internal/kv";
+import { sha256, textToBytes } from "./internal/crypto";
 
 export type NowFn = () => int;
 export type RandomFn = (n: usize) => Result<Bytes, AuthError>;
@@ -140,17 +142,17 @@ export function startRandom(s: Scope, fs: FsGrant): RandomService {
       return Ok(empty());
     }
     if (n > MAX_RANDOM_REQUEST) {
-      return Err(authError(InvalidInput, "random request is larger than 4096 bytes"));
+      return Err(authError(InputInvalid, "random request is larger than 4096 bytes"));
     }
     const r = channel<Option<string>>(1);
     if (tx.send(RandomRequest { n: n, reply: r.tx }).isErr()) {
-      return Err(authError(Entropy, "the random source is not running"));
+      return Err(authError(EntropyFailed, "the random source is not running"));
     }
     const got = r.rx.recv();
     r.rx.close();
     r.tx.close();
     if (got.isNone() || got.unwrap().isNone()) {
-      return Err(authError(Entropy, "the random source failed"));
+      return Err(authError(EntropyFailed, "the random source failed"));
     }
     return Ok(fromString(got.unwrap().unwrap()));
   };
@@ -171,7 +173,31 @@ export function constantRandom(byte: u8): RandomFn {
   };
 }
 
-// failingRandom(): RandomFn -- always `Err(Entropy)`. For tests of the failure paths.
+// failingRandom(): RandomFn -- always `Err(EntropyFailed)`. For tests of the failure paths.
 export function failingRandom(): RandomFn {
-  return (n: usize): Result<Bytes, AuthError> => Err(authError(Entropy, "no entropy (test)"));
+  return (n: usize): Result<Bytes, AuthError> => Err(authError(EntropyFailed, "no entropy (test)"));
+}
+
+// countingRandom(s): RandomService -- TEST ONLY. Distinct, reproducible bytes: block k of the stream is SHA-256 of the counter. It is
+// predictable by design (a session id made from it is guessable); it exists so that tests can create many sessions without a
+// kernel entropy source. Never use it in an application.
+export function countingRandom(s: Scope): RandomService {
+  const kv = startKv<int>(s);
+  const bytes = (n: usize): Result<Bytes, AuthError> => {
+    let out: u8[] = [];
+    while (out.length < n) {
+      const c = kv.update("n", (cur: Option<int>): Option<int> => Some(cur.unwrapOr(0) + 1));
+      if (c.isNone()) {
+        return Err(authError(EntropyFailed, "the counter service is gone"));
+      }
+      const block = sha256(textToBytes("orin-auth test random " + c.unwrap().toString())).toArray();
+      for (const b of block) {
+        if (out.length < n) {
+          out.push(b);
+        }
+      }
+    }
+    return Ok(fromArray(out));
+  };
+  return RandomService { bytes: bytes, stop: (): void => kv.close() };
 }

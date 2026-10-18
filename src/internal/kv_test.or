@@ -19,3 +19,16 @@ function putGetRemoveSweep(): void {
     kv.close();
   });
 }
+
+@Test
+function updateIsAReadModifyWrite(): void {
+  scope(s => {
+    const kv = startKv<int>(s);
+    const bump = (cur: Option<int>): Option<int> => Some(cur.unwrapOr(0) + 1);
+    assertEq(kv.update("n", bump).unwrap(), 1, "created");
+    assertEq(kv.update("n", bump).unwrap(), 2, "incremented");
+    assert(kv.update("n", (cur: Option<int>): Option<int> => None).isNone(), "removed");
+    assert(kv.get("n").isNone(), "gone");
+    kv.close();
+  });
+}

@@ -155,3 +155,10 @@ export function bytesToText(data: Bytes): string {
 export function textToBytes(s: string): Bytes {
   return fromString(s);
 }
+
+// pbkdf2DefaultIterations(): int -- the iteration count orin-auth uses for new password hashes. With this pure-Orin backend a
+// block of SHA-256 costs about 12 microseconds, so 20,000 iterations take about half a second. A native `std:crypto` makes
+// OWASP's 600,000 (PBKDF2-HMAC-SHA-256) affordable; change this one number then, or switch the default to argon2id.
+export function pbkdf2DefaultIterations(): int {
+  return 20000;
+}

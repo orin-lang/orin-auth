@@ -7,6 +7,7 @@ type Cmd<V> =
   Get(string, Sender<Option<V>>)
   | Put(string, V, Sender<bool>)
   | Remove(string, Sender<bool>)
+  | Update(string, (cur: Option<V>) => Option<V>, Sender<Option<V>>)
   | Sweep((v: V) => bool, Sender<int>)
   | Count(Sender<int>);
 
@@ -30,6 +31,15 @@ function ownerLoop<V>(rx: Receiver<Cmd<V>>): int {
             const had = items.has(k);
             items.delete(k);
             reply.send(had);
+          },
+          Update(k, f, reply) => {
+            const next = f(items.get(k));
+            if (next.isSome()) {
+              items.set(k, next.unwrap());
+            } else {
+              items.delete(k);
+            }
+            reply.send(next);
           },
           Sweep(pred, reply) => {
             let dead: string[] = [];
@@ -98,6 +108,20 @@ export class KvHandle<V> {
     r.rx.close();
     r.tx.close();
     return got.unwrapOr(false);
+  }
+
+  // update(key, f): Option<V> -- atomically replaces the value of `key` with `f(current)` (None removes the key) and answers the new
+  // value. `f` runs inside the owner task, so a read-modify-write cannot interleave with another task's. `f` captures values only.
+  // None also when the owner is gone.
+  update(key: string, f: (cur: Option<V>) => Option<V>): Option<V> {
+    const r = channel<Option<V>>(1);
+    if (this.tx.send(Update(key, f, r.tx)).isErr()) {
+      return None;
+    }
+    const got = r.rx.recv();
+    r.rx.close();
+    r.tx.close();
+    return got.isSome() ? got.unwrap() : None;
   }
 
   // sweep(pred): int -- removes every entry whose value satisfies `pred`; the number removed.

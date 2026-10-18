@@ -2,12 +2,29 @@ export {
   AuthMethod, ViaSession, ViaApiToken, ViaJwt, ViaOidc, ViaOther, Principal, authMethodName, newPrincipal, hasRole, hasScope,
   hasAnyRole, hasAllScopes, withPrincipal, withoutPrincipal, principalOf,
 } from "./principal";
-export { AuthErrorKind, InvalidConfig, InvalidInput, Entropy, Unavailable, Unsupported, AuthError, authError, authErrorMessage } from "./error";
+export { AuthErrorKind, ConfigInvalid, InputInvalid, EntropyFailed, ServiceUnavailable, FeatureUnsupported, AuthError, authError, authErrorMessage } from "./error";
 export {
   SameSite, SameSiteLax, SameSiteStrict, SameSiteNone, CookieAttrs, defaultCookieAttrs, sameSiteName, isCookieValue, checkCookie,
   setCookieValue, clearCookieValue, parseCookieHeader, requestCookie,
 } from "./cookie";
 export {
   NowFn, RandomFn, ClockService, RandomService, MAX_RANDOM_REQUEST, startClock, fixedClock, startRandom, constantRandom,
-  failingRandom,
+  failingRandom, countingRandom,
 } from "./services";
+export {
+  PasswordAlgorithm, Pbkdf2Sha256, Argon2id, PasswordPolicy, PasswordErrorKind, MalformedHash, UnsupportedAlgorithm, InvalidParams,
+  PasswordTooLong, NoEntropy, PasswordError, passwordErrorMessage, MAX_PASSWORD_BYTES, defaultPasswordPolicy, Phc, parsePhc,
+  hashPassword, verifyPassword, needsRehash, VerifyOutcome, PasswordRejected, PasswordAccepted, PasswordAcceptedRehashed, verifyAndUpgrade, dummyVerify,
+} from "./password";
+export {
+  SessionRecord, SessionStore, MemorySessionStore, SessionConfig, defaultSessionConfig, checkSessionConfig, NewSession, SessionLookup,
+  SessionAnonymous, SessionActive, SessionExpired, sessionIdHash, SessionManager,
+} from "./session";
+export {
+  AuthExtras, AuthOutcome, AuthAnonymous, AuthPassed, AuthFailed, Authenticator, noExtras, SESSION_ATTR, sessionIdHashOf,
+  sessionAuthenticator, authenticate,
+} from "./authn";
+export {
+  DenyMode, DenyJson, DenyRedirect, DenyByAccept, AuthzConfig, defaultAuthzConfig, pagesAuthzConfig, mixedAuthzConfig, safeNext,
+  requirePrincipal, requireAuthenticated, requireRole, requireAnyRole, requireScope, requireAllScopes, currentPrincipal,
+} from "./authz";
