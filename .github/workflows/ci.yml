@@ -30,12 +30,13 @@ jobs:
         with:
           path: orin-lang/build
           key: orin-toolchain-${{ runner.os }}-${{ env.ORIN_LANG_REF }}
-      - name: Build the Orin toolchain (tools/orin builds the dev CLI from the seed)
+      - name: Bootstrap the Orin compiler (about 4 minutes; skipped on a cache hit)
         if: steps.toolchain.outputs.cache-hit != 'true'
+        run: cd orin-lang && ./tools/bootstrap.sh
+      - name: Build the orin CLI from the bootstrapped compiler
         run: orin-lang/tools/orin --version
       - name: Check
         run: |
-          # tools/orin rebuilds only when its inputs changed; with the restored build it is a no-op.
           echo "ORIN=$PWD/orin-lang/tools/orin" >> "$GITHUB_ENV"
       - name: orin-auth tests, example and formatting
         run: tools/ci.sh
