@@ -19,7 +19,8 @@ echo "== examples/web-login"
 (cd examples/web-login && "$ORIN" fetch && "$ORIN" test && "$ORIN" run >/dev/null)
 
 echo "== formatting"
-"$ORIN" fmt --check
-(cd examples/web-login && "$ORIN" fmt --check)
+# Named paths only: CI checks orin-lang out inside the workspace, and a bare `fmt --check` would scan it too.
+"$ORIN" fmt --check src tests
+(cd examples/web-login && "$ORIN" fmt --check src tests)
 
 echo "ok"
