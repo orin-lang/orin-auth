@@ -1,0 +1,263 @@
+// API tokens: long-lived bearer credentials for scripts and services, with scopes and an expiry.
+//
+// A token looks like        orbit_3f9c1a0d7be24c58a1e0b6d2_Xk3...43 characters...
+//                           ^prefix ^id (24 hex)            ^secret (256 random bits, base64url)
+//
+//   * The PREFIX names your product ("orbit", "ghp"-style). It makes leaked tokens recognizable to secret scanners and humans, and
+//     lets `apiTokenAuthenticator` ignore bearer credentials that are not API tokens (a JWT, for example).
+//   * The ID is a public lookup key; the SECRET is what authenticates. Only SHA-256(secret) is stored, so a database leak does not
+//     leak usable tokens. The token is shown ONCE, when issued.
+//   * Verification compares SHA-256(presented secret) with the stored hash in constant time, and does the same work for an unknown
+//     id as for a known one, so response time does not reveal which ids exist.
+//   * A token has scopes (what it may do), optional roles, an optional expiry, and can be revoked.
+import { Bytes } from "std:bytes";
+import { Scope } from "std:task";
+import { Request } from "orin-web";
+import { AuthError, authError, ConfigInvalid, InputInvalid, ServiceUnavailable } from "./error";
+import { RandomFn } from "./services";
+import { Principal, ViaApiToken } from "./principal";
+import { AuthOutcome, AuthAnonymous, AuthPassed, AuthFailed, Authenticator, noExtras } from "./authn";
+import {
+  sha256, hexEncode, hexDecode, base64UrlEncode, constantTimeEquals, textToBytes,
+} from "./internal/crypto";
+import { KvHandle, startKv } from "./internal/kv";
+
+export type ApiTokenRecord = {
+  id: string;
+  secretHash: string;
+  subject: string;
+  name: string;
+  roles: string[];
+  scopes: string[];
+  createdAt: int;
+  expiresAt: Option<int>;
+  revoked: bool;
+};
+
+export interface ApiTokenStore {
+  load(id: string): Option<ApiTokenRecord>;
+  save(rec: ApiTokenRecord): bool;
+  remove(id: string): bool;
+  removeSubject(subject: string): int;
+}
+
+export class MemoryApiTokenStore implements ApiTokenStore {
+  private kv: KvHandle<ApiTokenRecord>;
+
+  constructor(kv: KvHandle<ApiTokenRecord>) {
+    this.kv = kv;
+  }
+
+  static start(s: Scope): MemoryApiTokenStore {
+    return new MemoryApiTokenStore(startKv<ApiTokenRecord>(s));
+  }
+
+  load(id: string): Option<ApiTokenRecord> {
+    return this.kv.get(id);
+  }
+
+  save(rec: ApiTokenRecord): bool {
+    return this.kv.put(rec.id, rec);
+  }
+
+  remove(id: string): bool {
+    return this.kv.remove(id);
+  }
+
+  removeSubject(subject: string): int {
+    return this.kv.sweep((r: ApiTokenRecord): bool => r.subject == subject);
+  }
+
+  size(): int {
+    return this.kv.count();
+  }
+
+  close(): void {
+    this.kv.close();
+  }
+}
+
+// What a new token is for. expiresAt: milliseconds since the epoch, None = never (prefer an expiry).
+export type TokenSpec = {
+  subject: string;
+  name: string;
+  roles: string[];
+  scopes: string[];
+  expiresAt: Option<int>;
+};
+
+export type IssuedToken = { token: string; record: ApiTokenRecord; };
+
+const ID_BYTES: usize = 12;
+const SECRET_BYTES: usize = 32;
+const ID_CHARS: usize = 24;
+const SECRET_CHARS: usize = 43;
+
+// A prefix is 2..16 lowercase letters or digits, so that the token splits unambiguously at the first underscore.
+export function isValidTokenPrefix(p: string): bool {
+  if (p.length < 2 || p.length > 16) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < p.length) {
+    const c = p.charCodeAt(i).toInt();
+    if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57))) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function isUnreservedToken(s: string): bool {
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i).toInt();
+    if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 95)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function nameOk(s: string): bool {
+  return s.length > 0 && !s.includes(",") && !s.includes(" ") && !s.includes("|");
+}
+
+// issueApiToken(store, random, prefix, spec, now): Result<IssuedToken, AuthError> -- creates and stores a token. Show `token` to the
+// user once; it cannot be recovered from the store.
+export function issueApiToken(
+  store: ApiTokenStore,
+  random: RandomFn,
+  prefix: string,
+  spec: TokenSpec,
+  now: int,
+): Result<IssuedToken, AuthError> {
+  if (!isValidTokenPrefix(prefix)) {
+    return Err(authError(ConfigInvalid, "token prefix must be 2..16 lowercase letters or digits"));
+  }
+  if (spec.subject.length == 0) {
+    return Err(authError(InputInvalid, "a token needs a subject"));
+  }
+  for (const r of spec.roles) {
+    if (!nameOk(r)) {
+      return Err(authError(InputInvalid, "role names must be non-empty and have no space, comma or |"));
+    }
+  }
+  for (const sc of spec.scopes) {
+    if (!nameOk(sc)) {
+      return Err(authError(InputInvalid, "scope names must be non-empty and have no space, comma or |"));
+    }
+  }
+  if (spec.expiresAt.isSome() && spec.expiresAt.unwrap() <= now) {
+    return Err(authError(InputInvalid, "the expiry is not in the future"));
+  }
+  const idBytes = random(ID_BYTES)?;
+  const secretBytes = random(SECRET_BYTES)?;
+  const id = hexEncode(idBytes);
+  const secret = base64UrlEncode(secretBytes);
+  const rec = ApiTokenRecord {
+    id: id,
+    secretHash: hexEncode(sha256(textToBytes(secret))),
+    subject: spec.subject,
+    name: spec.name,
+    roles: spec.roles,
+    scopes: spec.scopes,
+    createdAt: now,
+    expiresAt: spec.expiresAt,
+    revoked: false,
+  };
+  if (!store.save(rec)) {
+    return Err(authError(ServiceUnavailable, "the token store is not available"));
+  }
+  return Ok(IssuedToken { token: prefix + "_" + id + "_" + secret, record: rec });
+}
+
+export type TokenFailure = TokenMalformed | TokenUnknown | TokenWrongSecret | TokenExpired | TokenRevoked;
+
+export type TokenCheck = TokenValid(ApiTokenRecord) | TokenInvalid(TokenFailure);
+
+export function tokenFailureText(f: TokenFailure): string {
+  return match (f) {
+    TokenMalformed => "malformed token",
+    TokenUnknown => "unknown token",
+    TokenWrongSecret => "invalid token",
+    TokenExpired => "token expired",
+    TokenRevoked => "token revoked",
+  };
+}
+
+// splitToken(prefix, token): Option<(id, secret)> as a two-element list [id, secret] -- None unless the token has exactly the shape
+// `<prefix>_<24 hex>_<43 base64url>`.
+export function splitToken(prefix: string, token: string): Option<string[]> {
+  const head = prefix + "_";
+  if (token.length != head.length + ID_CHARS + 1 + SECRET_CHARS || !token.startsWith(head)) {
+    return None;
+  }
+  const id = token.substring(head.length, head.length + ID_CHARS);
+  const sep = token.substring(head.length + ID_CHARS, head.length + ID_CHARS + 1);
+  const secret = token.substring(head.length + ID_CHARS + 1, token.length);
+  if (sep != "_" || hexDecode(id).isNone() || !isUnreservedToken(secret)) {
+    return None;
+  }
+  return Some([id, secret]);
+}
+
+// verifyApiToken(store, prefix, token, now): TokenCheck -- see the module comment. The expiry and revocation are checked AFTER the
+// secret, so only the holder of a real token learns that it is expired or revoked.
+export function verifyApiToken(store: ApiTokenStore, prefix: string, token: string, now: int): TokenCheck {
+  const parts = splitToken(prefix, token);
+  if (parts.isNone()) {
+    return TokenInvalid(TokenMalformed);
+  }
+  const found = store.load(parts.unwrap()[0]);
+  const presented = sha256(textToBytes(parts.unwrap()[1]));
+  // An unknown id is compared against a fixed value, so both paths cost the same.
+  let expected = sha256(textToBytes("orin-auth unknown token"));
+  if (found.isSome()) {
+    const stored = hexDecode(found.unwrap().secretHash);
+    if (stored.isSome()) {
+      expected = stored.unwrap();
+    }
+  }
+  const same = constantTimeEquals(presented, expected);
+  if (found.isNone()) {
+    return TokenInvalid(TokenUnknown);
+  }
+  if (!same) {
+    return TokenInvalid(TokenWrongSecret);
+  }
+  const rec = found.unwrap();
+  if (rec.revoked) {
+    return TokenInvalid(TokenRevoked);
+  }
+  if (rec.expiresAt.isSome() && now >= rec.expiresAt.unwrap()) {
+    return TokenInvalid(TokenExpired);
+  }
+  return TokenValid(rec);
+}
+
+// revokeApiToken(store, id): bool -- deletes the token (the id is the one in the record and in the token's middle part).
+export function revokeApiToken(store: ApiTokenStore, id: string): bool {
+  return store.remove(id);
+}
+
+// apiTokenAuthenticator(store, prefix): Authenticator -- authenticates `Authorization: Bearer <prefix>_...`. A bearer credential
+// without the prefix is not ours: anonymous, so that a JWT authenticator can look at it. A bearer credential WITH the prefix that
+// fails is `AuthFailed` (401, `error="invalid_token"`).
+export function apiTokenAuthenticator(store: ApiTokenStore, prefix: string): Authenticator {
+  return (req: Request, now: int): AuthOutcome => {
+    const bearer = req.bearerToken();
+    if (bearer.isNone() || !bearer.unwrap().startsWith(prefix + "_")) {
+      return AuthAnonymous;
+    }
+    return match (verifyApiToken(store, prefix, bearer.unwrap(), now)) {
+      TokenValid(rec) => AuthPassed(
+        Principal { subject: rec.subject, roles: rec.roles, scopes: rec.scopes, method: ViaApiToken },
+        noExtras(),
+      ),
+      TokenInvalid(why) => AuthFailed(tokenFailureText(why), "Bearer error=\"invalid_token\""),
+    };
+  };
+}

@@ -1,0 +1,107 @@
+import { assert, assertEq, assertEqString, assertEqBool } from "std:test";
+import { Get, Post } from "std:http";
+import { scope } from "std:task";
+import { Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertHeader } from "orin-web";
+import { RateLimiter, RateLimitConfig, defaultLoginLimit, rateLimit, fixedClock } from "../src/module";
+
+function cfg(cap: int, every: int): RateLimitConfig {
+  return RateLimitConfig { capacity: cap, refillEveryMs: every, maxKeys: 1000 };
+}
+
+@Test
+function burstThenRefill(): void {
+  scope(s => {
+    const rl = RateLimiter.start(s, cfg(3, 1000)).unwrap();
+    assertEqBool(rl.allow("a", 0).allowed, true, "1");
+    assertEqBool(rl.allow("a", 0).allowed, true, "2");
+    const third = rl.allow("a", 0);
+    assertEqBool(third.allowed, true, "3");
+    assertEq(third.remaining, 0, "none left");
+    const fourth = rl.allow("a", 0);
+    assertEqBool(fourth.allowed, false, "4th refused");
+    assertEq(fourth.retryAfterMs, 1000, "a whole refill period");
+    assertEq(rl.allow("a", 400).retryAfterMs, 600, "time already waited is counted");
+    assertEqBool(rl.allow("a", 1000).allowed, true, "one token after a period");
+    assertEqBool(rl.allow("a", 1000).allowed, false, "and only one");
+    assertEqBool(rl.allow("a", 5000).allowed, true, "refilled");
+    assertEq(rl.allow("a", 100000).remaining, 2, "capped at capacity");
+    rl.close();
+  });
+}
+
+@Test
+function keysAreIndependentAndResettable(): void {
+  scope(s => {
+    const rl = RateLimiter.start(s, cfg(1, 60000)).unwrap();
+    assertEqBool(rl.allow("a", 0).allowed, true, "a");
+    assertEqBool(rl.allow("a", 1).allowed, false, "a again");
+    assertEqBool(rl.allow("b", 1).allowed, true, "b is separate");
+    rl.reset("a");
+    assertEqBool(rl.allow("a", 2).allowed, true, "reset by a successful login");
+    rl.close();
+  });
+}
+
+@Test
+function clockGoingBackwardsDoesNotGiveTokens(): void {
+  scope(s => {
+    const rl = RateLimiter.start(s, cfg(1, 1000)).unwrap();
+    rl.allow("a", 10000);
+    assertEqBool(rl.allow("a", 5000).allowed, false, "earlier timestamp");
+    rl.close();
+  });
+}
+
+@Test
+function memoryIsBounded(): void {
+  scope(s => {
+    const rl = RateLimiter.start(s, RateLimitConfig { capacity: 2, refillEveryMs: 1000, maxKeys: 3 }).unwrap();
+    rl.allow("a", 0);
+    rl.allow("b", 0);
+    rl.allow("c", 0);
+    assertEq(rl.size(), 3, "full");
+    assertEqBool(rl.allow("d", 0).allowed, false, "a new key is refused while the table is full of active buckets");
+    assertEqBool(rl.allow("a", 0).allowed, true, "known keys keep working");
+    assertEqBool(rl.allow("d", 10000).allowed, true, "idle buckets are swept to make room");
+    assert(rl.size() <= 3, "still bounded");
+    assertEq(rl.sweep(100000), 1, "the remaining idle bucket is dropped");
+    assertEq(rl.size(), 0, "empty");
+    rl.close();
+  });
+}
+
+@Test
+function configIsValidated(): void {
+  scope(s => {
+    assert(RateLimiter.start(s, cfg(0, 1000)).isErr(), "capacity");
+    assert(RateLimiter.start(s, cfg(1, 0)).isErr(), "refill");
+  });
+  assertEq(defaultLoginLimit().capacity, 5, "default");
+}
+
+@Test
+function middlewareAnswers429WithRetryAfter(): void {
+  scope(s => {
+    const rl = RateLimiter.start(s, cfg(2, 30000)).unwrap();
+    let app = new Router();
+    app.use(rateLimit(
+      rl,
+      (req: Request): Option<string> => req.path() == "/login" ? req.header("x-user") : None,
+      fixedClock(0),
+    ));
+    app.post("/login", (req: Request): Result<Response, WebError> => Ok(Response.text(200, "ok")));
+    app.get("/other", (req: Request): Result<Response, WebError> => Ok(Response.text(200, "ok")));
+    const c = new TestClient(app).withHeader("X-User", "ann");
+    assertStatus(c.send(testRequest(Post, "/login")), 200);
+    assertStatus(c.send(testRequest(Post, "/login")), 200);
+    const limited = c.send(testRequest(Post, "/login"));
+    assertStatus(limited, 429);
+    assertHeader(limited, "Retry-After", "30");
+    assertStatus(new TestClient(app).withHeader("X-User", "bob").send(testRequest(Post, "/login")), 200);
+    assertStatus(new TestClient(app).send(testRequest(Post, "/login")), 200);
+    for (const i of [1, 2, 3, 4]) {
+      assertStatus(c.get("/other"), 200);
+    }
+    rl.close();
+  });
+}

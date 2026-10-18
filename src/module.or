@@ -28,3 +28,18 @@ export {
   DenyMode, DenyJson, DenyRedirect, DenyByAccept, AuthzConfig, defaultAuthzConfig, pagesAuthzConfig, mixedAuthzConfig, safeNext,
   requirePrincipal, requireAuthenticated, requireRole, requireAnyRole, requireScope, requireAllScopes, currentPrincipal,
 } from "./authz";
+export { CsrfMode, CsrfTokenMode, CsrfHeaderMode, CsrfConfig, defaultCsrfConfig, CsrfProtection } from "./csrf";
+export {
+  ApiTokenRecord, ApiTokenStore, MemoryApiTokenStore, TokenSpec, IssuedToken, isValidTokenPrefix, issueApiToken, TokenFailure,
+  TokenMalformed, TokenUnknown, TokenWrongSecret, TokenExpired, TokenRevoked, TokenCheck, TokenValid, TokenInvalid, tokenFailureText,
+  splitToken, verifyApiToken, revokeApiToken, apiTokenAuthenticator,
+} from "./apitoken";
+export {
+  JwtAlg, JwtHS256, JwtRS256, JwtES256, jwtAlgName, SignatureVerifier, JwtKey, JwtSecret, JwtExternalKey, MIN_HMAC_KEY_BYTES, jwtSecret,
+  jwtExternalKey, JwtErrorKind, JwtMalformed, JwtTooLarge, JwtAlgNone, JwtAlgUnsupported, JwtAlgNotAllowed, JwtCritUnsupported,
+  JwtKeyUnknown, JwtBadSignature, JwtExpired, JwtNotYetValid, JwtWrongIssuer, JwtWrongAudience, JwtMissingClaim, JwtError,
+  jwtErrorMessage, JwtOptions, defaultJwtOptions, VerifiedJwt, jsonMemberOf, claimString, claimStrings, claimInt, jwtClaims, signJwt,
+  verifyJwt, jwtPrincipal, jwtAuthenticator,
+} from "./jwt";
+export { AUTHENTICATED, roleMiddlewareName, scopeMiddlewareName, authMiddlewares } from "./annotated";
+export { RateLimitConfig, defaultLoginLimit, Bucket, RateDecision, RateLimiter, rateLimit } from "./ratelimit";

@@ -1,0 +1,289 @@
+// CSRF protection for cookie-authenticated requests, as middleware.
+//
+// Browsers attach cookies to cross-site requests, so a cookie session alone cannot tell "the user clicked in our page" from "another
+// site made the browser send this". `csrfProtection` refuses state-changing requests (anything but GET, HEAD, OPTIONS, TRACE)
+// that do not prove they came from our own pages. Two proofs, chosen by `CsrfMode`:
+//
+//   CsrfTokenMode            a signed token, sent back in a header (`X-CSRF-Token`) or in a form field (`csrf_token`).
+//                            Token = base64url(nonce(16) || HMAC-SHA-256(key, "orin-auth csrf v1|" binding "|" nonce)), where
+//                            `binding` is the session (its id hash) or, before login, a random `__Host-csrf` cookie. The token is
+//                            therefore bound to the browser that got it, not guessable, and it changes on every issue (a fresh
+//                            nonce) so compression side channels (BREACH) cannot recover a stable secret from page sizes. No
+//                            server state is stored: it is a keyed MAC over a nonce and the binding (signed double-submit).
+//   CsrfHeaderMode(name)     the request must carry a custom header (for example `X-Requested-With`). A cross-site page cannot
+//                            add a custom header without a CORS preflight that this server would have to approve. Use it for
+//                            JSON APIs called by your own script; combine with a strict CORS policy.
+//
+// Both modes also apply the Origin checks of OWASP's recommendations: `Sec-Fetch-Site: cross-site` is refused; a present `Origin`
+// (or, without it, `Referer`) must be one of `allowedOrigins`, or, if that list is empty, must have the host of the request's
+// `Host` header. Requests with an `Authorization` header are exempt by default: a browser never adds that header by itself, so
+// such a request is not riding on ambient cookies. `skip` lets the application exempt more (webhooks with their own signature).
+//
+// Order: put `authenticate` first (the session binding comes from it), then `csrfProtection`.
+import { Bytes, fromString } from "std:bytes";
+import { PercentSpace, PlusAsSpace, parseQuery } from "std:url";
+import { methodName, isToken, toLowerAscii } from "std:http";
+import { Request, Response, WebError, Handler, Middleware, forbidden } from "orin-web";
+import { AuthError, authError, ConfigInvalid, InputInvalid } from "./error";
+import { RandomFn } from "./services";
+import { CookieAttrs, defaultCookieAttrs, checkCookie, setCookieValue, requestCookie } from "./cookie";
+import { sessionIdHashOf } from "./authn";
+import {
+  hmacSha256, constantTimeEquals, base64UrlEncode, base64UrlDecode, textToBytes,
+} from "./internal/crypto";
+
+export type CsrfMode = CsrfTokenMode | CsrfHeaderMode(string);
+
+// mode: see the module comment. headerName: where a token travels (token mode). fieldName: the form field. cookieName /
+// cookie: the pre-login binding cookie. allowedOrigins: exact origins ("https://app.example"); empty = same host as `Host`.
+// requireOrigin: refuse an unsafe request that has neither Origin nor Referer. exemptAuthorization: skip requests that carry
+// `Authorization`. skip: more exemptions.
+export type CsrfConfig = {
+  mode: CsrfMode;
+  headerName: string;
+  fieldName: string;
+  cookieName: string;
+  cookie: CookieAttrs;
+  allowedOrigins: string[];
+  requireOrigin: bool;
+  exemptAuthorization: bool;
+  skip: (req: Request) => bool;
+};
+
+export function defaultCsrfConfig(): CsrfConfig {
+  return CsrfConfig {
+    mode: CsrfTokenMode,
+    headerName: "X-CSRF-Token",
+    fieldName: "csrf_token",
+    cookieName: "__Host-csrf",
+    cookie: defaultCookieAttrs(),
+    allowedOrigins: [],
+    requireOrigin: false,
+    exemptAuthorization: true,
+    skip: (req: Request): bool => false,
+  };
+}
+
+const BINDING_ATTR: string = "auth.csrf.binding";
+const NONCE_BYTES: usize = 16;
+const MIN_KEY_BYTES: usize = 32;
+
+function isSafeMethod(m: string): bool {
+  return m == "GET" || m == "HEAD" || m == "OPTIONS" || m == "TRACE";
+}
+
+// The scheme-less host[:port] of an origin or URL ("https://a.example:8443/x" -> "a.example:8443"), "" when it has none.
+function hostOfOrigin(o: string): string {
+  const sep = o.indexOf("://");
+  if (sep.isNone()) {
+    return "";
+  }
+  const rest = o.substring(sep.unwrap() + 3, o.length);
+  const slash = rest.indexOf("/");
+  return slash.isSome() ? rest.substring(0, slash.unwrap()) : rest;
+}
+
+// The origin ("scheme://host[:port]") of a URL.
+function originOfUrl(u: string): string {
+  const sep = u.indexOf("://");
+  if (sep.isNone()) {
+    return "";
+  }
+  const rest = u.substring(sep.unwrap() + 3, u.length);
+  const slash = rest.indexOf("/");
+  return u.substring(0, sep.unwrap() + 3) + (slash.isSome() ? rest.substring(0, slash.unwrap()) : rest);
+}
+
+export class CsrfProtection {
+  private cfg: CsrfConfig;
+  private key: Bytes;
+  private random: RandomFn;
+
+  constructor(cfg: CsrfConfig, key: Bytes, random: RandomFn) {
+    this.cfg = cfg;
+    this.key = key;
+    this.random = random;
+  }
+
+  // CsrfProtection.create(config, key, random) -- `key` is a secret of at least 32 bytes (generate once, keep with your other
+  // secrets; changing it invalidates outstanding tokens).
+  static create(cfg: CsrfConfig, key: Bytes, random: RandomFn): Result<CsrfProtection, AuthError> {
+    if (key.length() < MIN_KEY_BYTES) {
+      return Err(authError(ConfigInvalid, "the CSRF key must be at least 32 bytes"));
+    }
+    if (!isToken(cfg.headerName)) {
+      return Err(authError(ConfigInvalid, "the CSRF header name is not a valid header name"));
+    }
+    match (cfg.mode) {
+      CsrfHeaderMode(name) => {
+        if (!isToken(name)) {
+          return Err(authError(ConfigInvalid, "the required header name is not a valid header name"));
+        }
+      },
+      CsrfTokenMode => {},
+    }
+    checkCookie(cfg.cookieName, "x", cfg.cookie)?;
+    return Ok(new CsrfProtection(cfg, key, random));
+  }
+
+  private mac(binding: string, nonce: Bytes): Bytes {
+    const msg = textToBytes("orin-auth csrf v1|" + binding + "|").concat(nonce);
+    return hmacSha256(this.key, msg);
+  }
+
+  // The binding of a request: its session, else the pre-login cookie.
+  private bindingOf(req: Request): Option<string> {
+    const s = sessionIdHashOf(req);
+    if (s.isSome()) {
+      return Some("s:" + s.unwrap());
+    }
+    const a = req.attr(BINDING_ATTR);
+    if (a.isSome() && a.unwrap().length > 0) {
+      return Some("c:" + a.unwrap());
+    }
+    return None;
+  }
+
+  // token(req): Result<string, AuthError> -- a token for the page being rendered, for the browser that made `req`. Embed it in a
+  // form (`<input type=hidden name=csrf_token value=...>`), a `<meta>` tag or a JSON response. Needs the middleware to have run.
+  token(req: Request): Result<string, AuthError> {
+    const b = this.bindingOf(req);
+    if (b.isNone()) {
+      return Err(authError(InputInvalid, "no CSRF binding: the csrfProtection middleware has not run for this request"));
+    }
+    const nonce = this.random(NONCE_BYTES)?;
+    return Ok(base64UrlEncode(nonce.concat(this.mac(b.unwrap(), nonce))));
+  }
+
+  // verify(req, token): bool -- the token was issued for the browser that made `req` (same session or binding cookie).
+  verify(req: Request, token: string): bool {
+    const b = this.bindingOf(req);
+    if (b.isNone() || token.length > 128) {
+      return false;
+    }
+    const raw = base64UrlDecode(token);
+    if (raw.isNone() || raw.unwrap().length() != NONCE_BYTES + 32) {
+      return false;
+    }
+    const nonce = raw.unwrap().slice(0, NONCE_BYTES);
+    const given = raw.unwrap().slice(NONCE_BYTES, NONCE_BYTES + 32);
+    return constantTimeEquals(given, this.mac(b.unwrap(), nonce));
+  }
+
+  // The token a request offers: header first, then the form field of a urlencoded body.
+  private offered(req: Request): Option<string> {
+    const h = req.header(this.cfg.headerName);
+    if (h.isSome() && h.unwrap().length > 0) {
+      return h;
+    }
+    const mt = req.mediaType();
+    if (mt.isSome() && mt.unwrap() == "application/x-www-form-urlencoded") {
+      const text = req.bodyText();
+      if (text.isOk()) {
+        const q = parseQuery(text.unwrap(), PlusAsSpace);
+        if (q.isOk()) {
+          for (const kv of q.unwrap()) {
+            if (kv.key == this.cfg.fieldName) {
+              return Some(kv.value);
+            }
+          }
+        }
+      }
+    }
+    return None;
+  }
+
+  // Is the request's Origin (or Referer) acceptable?  Err(reason) when not.
+  private originOk(req: Request): Result<void, string> {
+    const fetchSite = req.header("sec-fetch-site");
+    if (fetchSite.isSome() && toLowerAscii(fetchSite.unwrap()) == "cross-site") {
+      return Err("cross-site request");
+    }
+    let claimed = "";
+    const origin = req.header("origin");
+    if (origin.isSome() && origin.unwrap() != "null") {
+      claimed = origin.unwrap();
+    } else if (origin.isSome()) {
+      return Err("opaque origin");
+    } else {
+      const ref = req.header("referer");
+      if (ref.isSome()) {
+        claimed = originOfUrl(ref.unwrap());
+        if (claimed.length == 0) {
+          return Err("unreadable referer");
+        }
+      }
+    }
+    if (claimed.length == 0) {
+      return this.cfg.requireOrigin ? Err("no origin") : Ok();
+    }
+    if (this.cfg.allowedOrigins.length > 0) {
+      return this.cfg.allowedOrigins.includes(claimed) ? Ok() : Err("origin not allowed");
+    }
+    const host = req.header("host");
+    if (host.isSome() && hostOfOrigin(claimed) == host.unwrap()) {
+      return Ok();
+    }
+    return Err("origin does not match the host");
+  }
+
+  middleware(): Middleware {
+    return (req: Request, next: Handler): Result<Response, WebError> => {
+      const method = methodName(req.method());
+      if (isSafeMethod(method)) {
+        return this.safe(req, next);
+      }
+      if ((this.cfg.exemptAuthorization && req.header("authorization").isSome()) || this.cfg.skip(req)) {
+        return next(req);
+      }
+      const origin = this.originOk(req);
+      if (origin.isErr()) {
+        return Err(forbidden("csrf: " + origin.unwrapErr()));
+      }
+      // the binding cookie, if any (a session binds through the authenticator's attribute)
+      const cookie = requestCookie(req, this.cfg.cookieName);
+      const bound = cookie.isSome() && cookie.unwrap().length > 0 ? req.withAttr(BINDING_ATTR, cookie.unwrap()) : req;
+      match (this.cfg.mode) {
+        CsrfHeaderMode(name) => {
+          const v = req.header(name);
+          if (v.isNone() || v.unwrap().length == 0) {
+            return Err(forbidden("csrf: required header " + name + " is missing"));
+          }
+          return next(bound);
+        },
+        CsrfTokenMode => {
+          const t = this.offered(bound);
+          if (t.isNone()) {
+            return Err(forbidden("csrf: token missing"));
+          }
+          if (!this.verify(bound, t.unwrap())) {
+            return Err(forbidden("csrf: token invalid"));
+          }
+          return next(bound);
+        },
+      }
+    };
+  }
+
+  // Safe request: make sure the browser has a binding (a session, or a fresh `__Host-csrf` cookie) so that `token(req)` works.
+  private safe(req: Request, next: Handler): Result<Response, WebError> {
+    if (sessionIdHashOf(req).isSome()) {
+      return next(req);
+    }
+    const cookie = requestCookie(req, this.cfg.cookieName);
+    if (cookie.isSome() && cookie.unwrap().length >= 16) {
+      return next(req.withAttr(BINDING_ATTR, cookie.unwrap()));
+    }
+    const raw = this.random(NONCE_BYTES);
+    if (raw.isErr()) {
+      return Err(forbidden("csrf: no entropy"));
+    }
+    const value = base64UrlEncode(raw.unwrap());
+    const set = setCookieValue(this.cfg.cookieName, value, this.cfg.cookie);
+    const res = next(req.withAttr(BINDING_ATTR, value));
+    if (set.isErr() || res.isErr()) {
+      return res;
+    }
+    return Ok(res.unwrap().withAddedHeader("Set-Cookie", set.unwrap()));
+  }
+}

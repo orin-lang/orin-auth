@@ -1,0 +1,47 @@
+// The annotation layer: `@Authenticated`, `@RequiresRole("admin")`, `@RequiresScope("deploy")` and the principal in a controller
+// method, built on what orin-web's annotation model offers today.
+//
+// orin-web's controller processor reads `@Use("name, other")` (and `@Auth`, which is `@Use("auth")`) on a controller or a method and
+// looks the names up in the `Middlewares` registry that the application passes to the generated `registerControllers` / `buildApp`.
+// Annotation arguments are constants and a middleware is a function value, so the bridge is NAMES. orin-auth fixes the names:
+//
+//     @Use("authenticated")            any logged-in principal            (also available as @Auth)
+//     @Use("role:admin")               the principal has the role "admin"
+//     @Use("scope:deploy")             the principal has the scope "deploy"
+//     @Use("authenticated, scope:a")   several; the first is the outermost
+//
+// and `authMiddlewares` binds them. The registry is explicit about which roles and scopes exist, so a typo such as
+// `@Use("role:adnim")` stops the program at start-up (orin-web: exit 101 naming the controller, method and name) instead of
+// silently protecting nothing -- a property of fail-closed wiring that a free-text annotation would not have.
+//
+// The principal: a controller method that takes a parameter of type `Request` receives the request (orin-web binds it), and
+// `currentPrincipal(req)?` is the injected principal (401 when there is none). Annotations cannot target parameters yet, so a
+// `Principal` parameter bound by type is not possible; see docs/annotations.md for what orin-web would need.
+import { Middlewares } from "orin-web";
+import { AuthzConfig, requireAuthenticated, requireRole, requireScope } from "./authz";
+
+export const AUTHENTICATED: string = "authenticated";
+
+// roleMiddlewareName("admin") == "role:admin"
+export function roleMiddlewareName(role: string): string {
+  return "role:" + role;
+}
+
+// scopeMiddlewareName("deploy") == "scope:deploy"
+export function scopeMiddlewareName(scope: string): string {
+  return "scope:" + scope;
+}
+
+// authMiddlewares(base, cfg, roles, scopes): Middlewares -- `base` plus "authenticated" and "auth" (any principal), "role:<r>" for each
+// role in `roles` and "scope:<s>" for each scope in `scopes`. The denial behaviour (401 / 403 / redirect) is `cfg`. Put
+// `authenticate(..)` in the router with `Router.use` (global middleware), so that it runs before these.
+export function authMiddlewares(base: Middlewares, cfg: AuthzConfig, roles: string[], scopes: string[]): Middlewares {
+  let mws = base.with(AUTHENTICATED, requireAuthenticated(cfg)).with("auth", requireAuthenticated(cfg));
+  for (const r of roles) {
+    mws = mws.with(roleMiddlewareName(r), requireRole(cfg, r));
+  }
+  for (const s of scopes) {
+    mws = mws.with(scopeMiddlewareName(s), requireScope(cfg, s));
+  }
+  return mws;
+}

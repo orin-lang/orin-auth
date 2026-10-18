@@ -1,0 +1,343 @@
+import { assert, assertEq, assertEqString, assertEqBool, fail } from "std:test";
+import { Get } from "std:http";
+import { Bytes, fromString } from "std:bytes";
+import {
+  JsonValue, JsonMember, ValueString, ValueNumber, ValueBool, ValueObject, ValueArray,
+} from "std:json";
+import { numberFromInt } from "std:json/number";
+import * as encoding from "std:encoding";
+import {
+  Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertBody, assertHeader, withMiddleware,
+} from "orin-web";
+import {
+  JwtKey, JwtOptions, JwtAlg, JwtHS256, JwtRS256, JwtES256, JwtError, JwtErrorKind, JwtMalformed, JwtTooLarge, JwtAlgNone,
+  JwtAlgUnsupported, JwtAlgNotAllowed, JwtCritUnsupported, JwtKeyUnknown, JwtBadSignature, JwtExpired, JwtNotYetValid,
+  JwtWrongIssuer, JwtWrongAudience, JwtMissingClaim, jwtSecret, jwtExternalKey, defaultJwtOptions, verifyJwt, signJwt, jwtClaims,
+  claimString, claimStrings, claimInt, jwtPrincipal, jwtAuthenticator, authenticate, fixedClock, principalOf, requireScope,
+  defaultAuthzConfig, authMethodName, hasScope, hasRole,
+} from "../src/module";
+
+const NOW: int = 1700000000000;
+const SECRET: string = "0123456789abcdef0123456789abcdef";
+
+function key(): JwtKey {
+  return jwtSecret(None, fromString(SECRET)).unwrap();
+}
+
+function kidKey(kid: string, secret: string): JwtKey {
+  return jwtSecret(Some(kid), fromString(secret)).unwrap();
+}
+
+function kindOf(r: Result<JsonValue, JwtError>): JwtErrorKind {
+  return r.unwrapErr().kind;
+}
+
+function check(token: string, keys: JwtKey[], o: JwtOptions): Result<bool, JwtError> {
+  const r = verifyJwt(token, keys, o, NOW);
+  if (r.isErr()) {
+    return Err(r.unwrapErr());
+  }
+  return Ok(true);
+}
+
+function failsWith(r: Result<bool, JwtError>, kind: JwtErrorKind, what: string): void {
+  assert(r.isErr(), what + ": must be refused");
+  assertEqBool(r.unwrapErr().kind == kind, true, what + ": kind");
+}
+
+// Tokens made with Python (hmac / hashlib) for the secret above; payload {"sub":"ann","exp":2000000000} unless noted.
+const OWN: string = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9.HzOING_i_qksxSkxHrC8X6IPjxpfXIamKIe-_csp8Rk";
+
+// ---------------------------------------------------------------------------------------------- RFC 7515 appendix A.1
+
+const RFC_TOKEN: string = "eyJ0eXAiOiJKV1QiLA0KICJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const RFC_KEY: string = "AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow";
+
+@Test
+function rfc7515AppendixA1Hs256Vector(): void {
+  const secret = encoding.base64UrlDecodeText(RFC_KEY, encoding.Unpadded).unwrap();
+  const k = jwtSecret(None, secret).unwrap();
+  // The token expired in 2011 (exp 1300819380): verify as of 2011-03-22 18:00 UTC.
+  const at = 1300819200000;
+  const v = verifyJwt(RFC_TOKEN, [k], defaultJwtOptions(), at);
+  assert(v.isOk(), "the RFC 7515 A.1 token verifies");
+  assertEqString(claimString(v.unwrap().claims, "iss").unwrap(), "joe", "iss");
+  assertEq(claimInt(v.unwrap().claims, "exp").unwrap(), 1300819380, "exp");
+  // the same token, as of 2011-03-22 19:00 UTC, is expired
+  const late = verifyJwt(RFC_TOKEN, [k], JwtOptions { ...defaultJwtOptions(), leewaySeconds: 0 }, 1300822800000);
+  assertEqBool(late.unwrapErr().kind == JwtExpired, true, "expired");
+  // and it fails with any other key
+  assertEqBool(verifyJwt(RFC_TOKEN, [key()], defaultJwtOptions(), at).unwrapErr().kind == JwtBadSignature, true, "other key");
+}
+
+@Test
+function rfc7515VectorBitFlipsAreRefused(): void {
+  const secret = encoding.base64UrlDecodeText(RFC_KEY, encoding.Unpadded).unwrap();
+  const k = jwtSecret(None, secret).unwrap();
+  const at = 1300819200000;
+  // flip one character in each of the three parts
+  let i: usize = 0;
+  const positions: usize[] = [3, 60, 150, 170];
+  for (const p of positions) {
+    const c = RFC_TOKEN.substring(p, p + 1);
+    const swapped = c == "A" ? "B" : "A";
+    const bad = RFC_TOKEN.substring(0, p) + swapped + RFC_TOKEN.substring(p + 1, RFC_TOKEN.length);
+    assert(verifyJwt(bad, [k], defaultJwtOptions(), at).isErr(), "tampered at " + p.toString());
+  }
+}
+
+// ---------------------------------------------------------------------------------------------- signing
+
+@Test
+function signedTokenMatchesAnIndependentImplementation(): void {
+  const claims = ValueObject([
+    JsonMember { key: "sub", value: ValueString("ann") },
+    JsonMember { key: "exp", value: ValueNumber(numberFromInt(2000000000)) },
+  ]);
+  assertEqString(signJwt(key(), claims).unwrap(), OWN, "byte for byte what Python's hmac produces");
+}
+
+@Test
+function signThenVerifyRoundTrip(): void {
+  const claims = jwtClaims("ann", "https://issuer.example", "orbit-api", 1700000000, 1700003600, [
+    JsonMember { key: "roles", value: ValueArray([ValueString("admin")]) },
+    JsonMember { key: "scope", value: ValueString("read deploy") },
+  ]);
+  const k = kidKey("k1", SECRET);
+  const token = signJwt(k, claims).unwrap();
+  const o = JwtOptions { ...defaultJwtOptions(), issuer: Some("https://issuer.example"), audience: Some("orbit-api") };
+  const v = verifyJwt(token, [k], o, NOW + 1000).unwrap();
+  assertEqString(v.kid.unwrap(), "k1", "kid");
+  const p = jwtPrincipal(v).unwrap();
+  assertEqString(p.subject, "ann", "subject");
+  assert(hasScope(p, "deploy") && hasScope(p, "read"), "scopes from the scope claim");
+  assert(hasRole(p, "admin"), "roles");
+  assertEqString(authMethodName(p.method), "jwt", "method");
+}
+
+@Test
+function shortSecretsAreRefused(): void {
+  assert(jwtSecret(None, fromString("too short")).isErr(), "under 32 bytes");
+  assert(jwtExternalKey(None, JwtHS256, (a: Bytes, b: Bytes): bool => true).isErr(), "HS256 is not an external key");
+}
+
+// ---------------------------------------------------------------------------------------------- the attacks
+
+@Test
+function algNoneIsNeverAccepted(): void {
+  const o = defaultJwtOptions();
+  // unsecured tokens, empty signature, in every spelling
+  const payload = "eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9";
+  failsWith(check("eyJhbGciOiJub25lIn0." + payload + ".", [key()], o), JwtAlgNone, "none, empty signature");
+  failsWith(check("eyJhbGciOiJub25lIn0." + payload, [key()], o), JwtMalformed, "none, no signature part");
+  failsWith(check("eyJhbGciOiJOb25lIn0." + payload + ".", [key()], o), JwtAlgNone, "None");
+  failsWith(check("eyJhbGciOiJOT05FIn0." + payload + ".", [key()], o), JwtAlgNone, "NONE");
+  // alg none with a (valid HMAC) signature attached
+  failsWith(check("eyJhbGciOiJub25lIn0.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9.t3DGxPDZHHdkMsXegbdrUOKPdzxKLiSAwXenZQwXGkY", [key()], o), JwtAlgNone, "none with a signature");
+  // even if an application (wrongly) lists everything, none is not an algorithm
+  const lax = JwtOptions { ...o, algorithms: [JwtHS256, JwtRS256, JwtES256] };
+  failsWith(check("eyJhbGciOiJub25lIn0." + payload + ".", [key()], lax), JwtAlgNone, "none with a lax allow-list");
+  // missing alg, empty alg, non-string alg
+  failsWith(check("e30." + payload + ".AAAA", [key()], o), JwtMalformed, "no alg");
+  failsWith(check("eyJhbGciOiIifQ." + payload + ".AAAA", [key()], o), JwtAlgUnsupported, "empty alg");
+  failsWith(check("eyJhbGciOjF9." + payload + ".AAAA", [key()], o), JwtMalformed, "alg is a number");
+}
+
+@Test
+function algorithmConfusionIsImpossible(): void {
+  // a token that says RS256 but carries an HMAC made with the (secret or public) key bytes
+  const rs256Hmac = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9.2tMLxeXSQXWgE_8yPQlA21Cbl3DUyi72DriuRUEGJ6w";
+  failsWith(check(rs256Hmac, [key()], defaultJwtOptions()), JwtAlgNotAllowed, "RS256 is not in the allow-list");
+  // even when RS256 is allowed, an HMAC secret key is for HS256 only
+  const lax = JwtOptions { ...defaultJwtOptions(), algorithms: [JwtHS256, JwtRS256] };
+  failsWith(check(rs256Hmac, [key()], lax), JwtAlgNotAllowed, "key is an HMAC key, token claims RS256");
+  // and the reverse: an external RS256 key can never verify an HS256 token
+  const rsKey = jwtExternalKey(None, JwtRS256, (a: Bytes, b: Bytes): bool => true).unwrap();
+  failsWith(check(OWN, [rsKey], lax), JwtAlgNotAllowed, "HS256 token against an RS256 key");
+  // HS384 / HS512 are unknown to this library
+  failsWith(check("eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9.nhOKcuv3vpgPCiBx6eSxHY8JCMQv5xC6FCL3rI_k82I", [key()], lax), JwtAlgUnsupported, "HS384");
+}
+
+@Test
+function tokensCannotBringTheirOwnKeys(): void {
+  // signed with an attacker key and carrying that key as an embedded "jwk": never used
+  const jwk = "eyJhbGciOiJIUzI1NiIsImp3ayI6eyJrdHkiOiJvY3QiLCJrIjoiQUFBQSJ9fQ.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9.lDzDDTCAcTLMp7soVqnowA1YY4hbmcw6yGDyk4zgFRg";
+  failsWith(check(jwk, [key()], defaultJwtOptions()), JwtBadSignature, "embedded jwk is ignored");
+}
+
+@Test
+function criticalHeadersAndMalformedHeadersAreRefused(): void {
+  const o = defaultJwtOptions();
+  failsWith(check("eyJhbGciOiJIUzI1NiIsImNyaXQiOlsiZXhwIl19.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9.EpHpw3Q0qzCueLxfzg2awz2Q8H0nma_pIKyE0E9GXPI", [key()], o), JwtCritUnsupported, "crit");
+  failsWith(check("eyJhbGciOiJIUzI1NiIsImFsZyI6IkhTMjU2In0.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9.UDipu2B_-04ppmeRsyrYPOA-_bkF082bB2kZYdKgPKE", [key()], o), JwtMalformed, "duplicate alg member");
+  failsWith(check("W10.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9.u-ZQbZEvm89dbV_h5k8zvPy1geOKXMqzNBTknXF9Rw0", [key()], o), JwtMalformed, "header is an array");
+  failsWith(check("eyJhbGciOiJIUzI1NiIsImtpZCI6NX0.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9.5B6BrtQwNwCMNtv59S_z0uiZKeLbkSjWpek5Ds5X8mk", [key()], o), JwtMalformed, "kid is a number");
+}
+
+@Test
+function shapeErrors(): void {
+  const o = defaultJwtOptions();
+  failsWith(check("", [key()], o), JwtMalformed, "empty");
+  failsWith(check("a.b", [key()], o), JwtMalformed, "two parts");
+  failsWith(check("a.b.c.d", [key()], o), JwtMalformed, "four parts");
+  failsWith(check("..", [key()], o), JwtMalformed, "empty parts");
+  failsWith(check(".eyJzdWIiOiJhbm4ifQ.AAAA", [key()], o), JwtMalformed, "empty header");
+  failsWith(check("!!!!.eyJzdWIiOiJhbm4ifQ.AAAA", [key()], o), JwtMalformed, "not base64url");
+  const parts = OWN.split(".");
+  failsWith(check(parts[0] + "=." + parts[1] + "." + parts[2], [key()], o), JwtMalformed, "padding");
+  failsWith(check(parts[0] + "." + parts[1] + "." + parts[2] + "=", [key()], o), JwtMalformed, "padded signature");
+  failsWith(check(parts[0] + "." + parts[1] + ". " + parts[2], [key()], o), JwtMalformed, "whitespace");
+  failsWith(check(" " + OWN, [key()], o), JwtMalformed, "leading space");
+  failsWith(check(OWN, [key()], JwtOptions { ...o, maxTokenBytes: 50 }), JwtTooLarge, "too large");
+  failsWith(check(parts[0] + "." + parts[1] + ".", [key()], o), JwtBadSignature, "empty signature of an HS256 token");
+  failsWith(check(parts[0] + "." + parts[1] + ".AAAA", [key()], o), JwtBadSignature, "short signature");
+  failsWith(check("eyJhbGciOiJIUzI1NiJ9.WzFd.Rpo2xEeZb82BajcqCRZiv6-7XSeJtl-nG9oRPwQkdwo", [key()], o), JwtMalformed, "payload is an array (signed)");
+}
+
+@Test
+function tamperedPayloadAndSignatureAreRefused(): void {
+  const parts = OWN.split(".");
+  // swap in a payload with a later expiry or another subject, keep the old signature
+  const forgedPayload = "eyJzdWIiOiJhZG1pbiIsImV4cCI6MjAwMDAwMDAwMH0";
+  failsWith(check(parts[0] + "." + forgedPayload + "." + parts[2], [key()], defaultJwtOptions()), JwtBadSignature, "forged payload");
+  const mid = parts[2].substring(20, 21);
+  const sig = parts[2].substring(0, 20) + (mid == "k" ? "l" : "k") + parts[2].substring(21, 43);
+  failsWith(check(parts[0] + "." + parts[1] + "." + sig, [key()], defaultJwtOptions()), JwtBadSignature, "a signature character");
+  assert(check(OWN, [key()], defaultJwtOptions()).isOk(), "the unmodified token passes");
+}
+
+// ---------------------------------------------------------------------------------------------- claims
+
+@Test
+function expiryAndSkew(): void {
+  const o = JwtOptions { ...defaultJwtOptions(), leewaySeconds: 60 };
+  // exp = 2000000000
+  assert(verifyJwt(OWN, [key()], o, 2000000000 * 1000 - 1).isOk(), "just before exp");
+  assert(verifyJwt(OWN, [key()], o, 2000000000 * 1000 + 59000).isOk(), "within the leeway after exp");
+  assertEqBool(verifyJwt(OWN, [key()], o, 2000000000 * 1000 + 60000).unwrapErr().kind == JwtExpired, true, "leeway over");
+  const strict = JwtOptions { ...o, leewaySeconds: 0 };
+  assert(verifyJwt(OWN, [key()], strict, 2000000000 * 1000 - 1).isOk(), "strict: before");
+  assertEqBool(verifyJwt(OWN, [key()], strict, 2000000000 * 1000).unwrapErr().kind == JwtExpired, true, "strict: at exp");
+}
+
+@Test
+function notBefore(): void {
+  const t = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDAsIm5iZiI6MTkwMDAwMDAwMH0.V-4LT3GYEnE3HyHqNrABimycGw6UkBqgmmTRVXQTASY";
+  const o = JwtOptions { ...defaultJwtOptions(), leewaySeconds: 60 };
+  failsWith(check(t, [key()], o), JwtNotYetValid, "nbf in the future");
+  assert(verifyJwt(t, [key()], o, 1900000000 * 1000 - 59000).isOk(), "within skew before nbf");
+  assert(verifyJwt(t, [key()], o, 1900000000 * 1000 + 1).isOk(), "after nbf");
+}
+
+@Test
+function expIsRequiredByDefaultAndMustBeAnInteger(): void {
+  const noexp = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbm4ifQ.oXgO8QuXJbN8wPn7kSrx5AOcdGI8kDZGnGeb3CZe5bM";
+  failsWith(check(noexp, [key()], defaultJwtOptions()), JwtMissingClaim, "no exp");
+  assert(check(noexp, [key()], JwtOptions { ...defaultJwtOptions(), requireExp: false }).isOk(), "allowed when requireExp is off");
+  failsWith(check("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDAuNX0.wUziUY8gCvnGVyCPG25lMILOVFaBLznnDfAaJHcASqo", [key()], defaultJwtOptions()), JwtMalformed, "fractional exp");
+  failsWith(check("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbm4iLCJleHAiOiIyMDAwMDAwMDAwIn0.0pPqfQSE8gJwJMxKdlo-ifyQBy_wBKMhiE2H8K2GMrU", [key()], defaultJwtOptions()), JwtMalformed, "exp as a string");
+}
+
+@Test
+function issuerAndAudience(): void {
+  const arr = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJhIiwiYiJdLCJpc3MiOiJtZSJ9.bfftnGbnsKFMH-GBKg3g8LrcILz1G5GJs_bI9cEPORY";
+  const str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6ImEiLCJpc3MiOiJtZSJ9.2xXTL1q6TYbbjEWqYE0ifxu01ARgjCCNjfKXwgzoOr8";
+  const o = defaultJwtOptions();
+  assert(check(arr, [key()], JwtOptions { ...o, audience: Some("b"), issuer: Some("me") }).isOk(), "aud array contains it");
+  assert(check(str, [key()], JwtOptions { ...o, audience: Some("a"), issuer: Some("me") }).isOk(), "aud string equals it");
+  failsWith(check(arr, [key()], JwtOptions { ...o, audience: Some("c") }), JwtWrongAudience, "other audience (array)");
+  failsWith(check(str, [key()], JwtOptions { ...o, audience: Some("ab") }), JwtWrongAudience, "audience is exact, not a prefix");
+  failsWith(check(OWN, [key()], JwtOptions { ...o, audience: Some("a") }), JwtWrongAudience, "no aud claim at all");
+  failsWith(check(arr, [key()], JwtOptions { ...o, issuer: Some("you") }), JwtWrongIssuer, "other issuer");
+  failsWith(check(OWN, [key()], JwtOptions { ...o, issuer: Some("me") }), JwtWrongIssuer, "no iss claim");
+  assert(check(OWN, [key()], o).isOk(), "no expectation, no check");
+}
+
+// ---------------------------------------------------------------------------------------------- keys
+
+@Test
+function kidSelectsTheKey(): void {
+  const k1 = kidKey("k1", SECRET);
+  const k2 = kidKey("k2", "second-secret-second-secret-second");
+  const t1 = "eyJhbGciOiJIUzI1NiIsImtpZCI6ImsxIn0.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9.L8SzXSOKSaHFQE5lwf4Lo643cvKLye72-U8GnJBnAhQ";
+  const t2 = "eyJhbGciOiJIUzI1NiIsImtpZCI6ImsyIn0.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9.BxNpWjFmFXhPgsD4jVL1tk4mLVQhD9YmUcJZgtoZ7q8";
+  const tz = "eyJhbGciOiJIUzI1NiIsImtpZCI6Inp6In0.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9.sU_3T-Gq8YD5VGBHS3SIGEjpJiiWHa2ATpLlXLdLzZs";
+  const o = defaultJwtOptions();
+  assert(check(t1, [k1, k2], o).isOk(), "k1");
+  assert(check(t2, [k1, k2], o).isOk(), "k2 (key rotation: both are accepted)");
+  assert(check(t2, [k1], o).isErr(), "k2 unknown");
+  failsWith(check(tz, [k1, k2], o), JwtKeyUnknown, "unknown kid");
+  // a kid that points at the wrong key's signature
+  failsWith(check(t1, [kidKey("k1", "second-secret-second-secret-second")], o), JwtBadSignature, "kid matches but the key differs");
+  // no kid in the token: a one-key set uses it, a multi-key set does not guess
+  assert(check(OWN, [k1], o).isOk(), "no kid, one key");
+  failsWith(check(OWN, [k1, k2], o), JwtKeyUnknown, "no kid, several keys");
+  assert(check(OWN, [key(), k2], o).isOk(), "no kid matches the key without kid");
+  failsWith(check(OWN, [], o), JwtKeyUnknown, "no keys");
+}
+
+@Test
+function externalKeysVerifyThroughTheHook(): void {
+  // RS256 / ES256 verification is the application's (or std:crypto's) job; the library supplies the shared checks.
+  // Token: {"alg":"RS256"} . {"sub":"ann","exp":2000000000} . "sig!"  (the "signature" is just bytes the hook recognises)
+  const signature = "c2lnIQ";
+  const token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9." + signature;
+  const o = JwtOptions { ...defaultJwtOptions(), algorithms: [JwtRS256] };
+  const accepting = jwtExternalKey(None, JwtRS256, (input: Bytes, sig: Bytes): bool => sig.equals(fromString("sig!"))
+    && input.equals(fromString("eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9"))).unwrap();
+  const rejecting = jwtExternalKey(None, JwtRS256, (input: Bytes, sig: Bytes): bool => false).unwrap();
+  assert(check(token, [accepting], o).isOk(), "the hook says yes, with the exact signing input and the decoded signature");
+  failsWith(check(token, [rejecting], o), JwtBadSignature, "the hook says no");
+  // claims are still checked
+  failsWith(check(token, [accepting], JwtOptions { ...o, audience: Some("x") }), JwtWrongAudience, "claims still apply");
+  // an ES256 token against an RS256 key
+  failsWith(check("eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDB9." + signature, [accepting], JwtOptions { ...o, algorithms: [JwtRS256, JwtES256] }), JwtAlgNotAllowed, "ES256 token, RS256 key");
+}
+
+// ---------------------------------------------------------------------------------------------- claim helpers and the authenticator
+
+@Test
+function principalMapping(): void {
+  const scoped = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDAsInNjb3BlIjoicmVhZCBkZXBsb3kiLCJzY3AiOlsiZXh0cmEiXSwicm9sZXMiOlsiYWRtaW4iXX0.xicwmxe0R4nnkgGeybqEKUtb7577WVFiYklz1tik_Fs";
+  const v = verifyJwt(scoped, [key()], defaultJwtOptions(), NOW).unwrap();
+  const p = jwtPrincipal(v).unwrap();
+  assert(p.scopes == ["read", "deploy", "extra"], "scope string split on spaces, then scp");
+  assert(p.roles == ["admin"], "roles");
+  const nosub = verifyJwt("eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjIwMDAwMDAwMDB9.HZqu0zoMNB2N5ubTegxW35DmNVYa4Mn5x0eGt2rED2s", [key()], defaultJwtOptions(), NOW).unwrap();
+  assert(jwtPrincipal(nosub).isNone(), "no subject, no principal");
+}
+
+@Test
+function bearerAuthenticationThroughTheMiddleware(): void {
+  let app = new Router();
+  const scoped = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbm4iLCJleHAiOjIwMDAwMDAwMDAsInNjb3BlIjoicmVhZCBkZXBsb3kiLCJzY3AiOlsiZXh0cmEiXSwicm9sZXMiOlsiYWRtaW4iXX0.xicwmxe0R4nnkgGeybqEKUtb7577WVFiYklz1tik_Fs";
+  app.use(authenticate([jwtAuthenticator([key()], defaultJwtOptions(), jwtPrincipal)], fixedClock(NOW)));
+  app.get("/who", (req: Request): Result<Response, WebError> => {
+    const p = principalOf(req);
+    return Ok(Response.text(200, p.isSome() ? p.unwrap().subject : "anonymous"));
+  });
+  app.get("/deploy", withMiddleware(requireScope(defaultAuthzConfig(), "deploy"), (req: Request): Result<Response, WebError> => Ok(Response.text(200, "ok"))));
+  const c = new TestClient(app);
+  assertBody(c.get("/who"), "anonymous");
+  assertBody(c.withHeader("Authorization", "Bearer " + OWN).get("/who"), "ann");
+  assertStatus(c.withHeader("Authorization", "Bearer " + scoped).get("/deploy"), 200);
+  assertStatus(c.withHeader("Authorization", "Bearer " + OWN).get("/deploy"), 403);
+  const tampered = c.withHeader("Authorization", "Bearer " + OWN.substring(0, OWN.length - 2) + "xx").get("/who");
+  assertStatus(tampered, 401);
+  assertHeader(tampered, "WWW-Authenticate", "Bearer error=\"invalid_token\"");
+  assert(!tampered.bodyText().includes(OWN), "the token is not echoed");
+  const none = c.withHeader("Authorization", "Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbiIsImV4cCI6MjAwMDAwMDAwMH0.").get("/who");
+  assertStatus(none, 401);
+  // not JWT-shaped: not this authenticator's business
+  assertBody(c.withHeader("Authorization", "Bearer opaque-token").get("/who"), "anonymous");
+}
+
+@Test
+function claimHelpers(): void {
+  const v = verifyJwt(OWN, [key()], defaultJwtOptions(), NOW).unwrap();
+  assertEqString(claimString(v.claims, "sub").unwrap(), "ann", "string");
+  assert(claimString(v.claims, "exp").isNone(), "a number is not a string");
+  assert(claimInt(v.claims, "sub").isNone(), "a string is not an int");
+  assertEq(claimStrings(v.claims, "sub").length.toInt(), 1, "one string");
+  assertEq(claimStrings(v.claims, "none").length.toInt(), 0, "absent");
+}
