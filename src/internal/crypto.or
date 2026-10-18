@@ -1,0 +1,174 @@
+// The ONE module through which orin-auth reaches cryptographic primitives.
+//
+// TEMPORARY. The names and signatures below are the ones orin-auth expects from `std:crypto`. When that module lands, this file
+// shrinks to re-exports (or thin adapters) and `internal/sha256.or` is deleted. Everything else in orin-auth imports crypto from
+// here only, so that switching is one file.
+//
+// What is implemented here, and nothing beyond the standard constructions:
+//   sha256(data)                              FIPS 180-4
+//   hmacSha256(key, data)                     RFC 2104 / FIPS 198-1
+//   pbkdf2HmacSha256(password, salt, c, n)    RFC 8018 section 5.2
+//   constantTimeEquals(a, b)                  compares every byte of equal-length inputs; a length difference returns early
+//   base64UrlEncode / base64UrlDecode         RFC 4648 section 5, no padding (the JOSE form)
+//
+// Expected from `std:crypto` and NOT available here: argon2id (PHC strings), SHA-512, HKDF, RSA/ECDSA verification, and a
+// secure random source that needs no grant (see random.or for how randomness is obtained meanwhile).
+import { Bytes, ByteBuilder, fromString, empty } from "std:bytes";
+import * as encoding from "std:encoding";
+import { xorTable, x32, sha256Init, compressBlocks, sha256Finish, sha256With } from "./sha256";
+
+// sha256(data): Bytes -- 32 bytes.
+export function sha256(data: Bytes): Bytes {
+  return sha256With(xorTable(), data);
+}
+
+// The key block of HMAC: the key (hashed when longer than 64 bytes) padded with zeros to 64 bytes, XOR `pad`.
+function keyBlock(t: int[], key: Bytes, pad: int): Bytes {
+  const k = key.length() > 64 ? sha256With(t, key) : key;
+  let b = new ByteBuilder();
+  let i: usize = 0;
+  while (i < 64) {
+    const kb = i < k.length() ? k.at(i).toInt() : 0;
+    b.appendU8(x32(t, kb, pad).toU8());
+    i += 1;
+  }
+  return b.build();
+}
+
+// A prepared HMAC-SHA-256 key: the states after the inner and outer pad blocks. `PBKDF2` uses it so that each iteration costs
+// two compressions plus the padding blocks, not four.
+export type HmacKey = { table: int[]; inner: int[]; outer: int[]; };
+
+export function hmacSha256Key(key: Bytes): HmacKey {
+  const t = xorTable();
+  return HmacKey {
+    table: t,
+    inner: compressBlocks(t, sha256Init(), keyBlock(t, key, 54)),
+    outer: compressBlocks(t, sha256Init(), keyBlock(t, key, 92)),
+  };
+}
+
+// hmacWith(k, data): Bytes -- HMAC-SHA-256 with a prepared key.
+export function hmacWith(k: HmacKey, data: Bytes): Bytes {
+  const full = data.length() / 64 * 64;
+  const h = compressBlocks(k.table, k.inner, data.slice(0, full));
+  const inner = sha256Finish(k.table, h, data.slice(full, data.length()), 64 + full);
+  return sha256Finish(k.table, k.outer, inner, 64);
+}
+
+// hmacSha256(key, data): Bytes -- 32 bytes.
+export function hmacSha256(key: Bytes, data: Bytes): Bytes {
+  return hmacWith(hmacSha256Key(key), data);
+}
+
+// pbkdf2HmacSha256(password, salt, iterations, length): Bytes -- RFC 8018 PBKDF2 with HMAC-SHA-256. Requires iterations >= 1 and
+// length >= 1 (a violation traps: the callers validate parameters before).
+export function pbkdf2HmacSha256(
+  password: Bytes,
+  salt: Bytes,
+  iterations: int,
+  length: usize,
+): Bytes {
+  assertPositive(iterations, length);
+  const k = hmacSha256Key(password);
+  let out = new ByteBuilder();
+  let block: int = 1;
+  while (out.length() < length) {
+    let s = new ByteBuilder();
+    s.appendBytes(salt);
+    s.appendU32Be(block.toU32());
+    let u = hmacWith(k, s.build());
+    let acc: u8[] = u.toArray();
+    let n: int = 1;
+    while (n < iterations) {
+      u = hmacWith(k, u);
+      let i: usize = 0;
+      while (i < 32) {
+        acc[i] = x32(k.table, acc[i].toInt(), u.at(i).toInt()).toU8();
+        i += 1;
+      }
+      n += 1;
+    }
+    let i: usize = 0;
+    while (i < 32 && out.length() < length) {
+      out.appendU8(acc[i]);
+      i += 1;
+    }
+    block += 1;
+  }
+  return out.build();
+}
+
+function assertPositive(iterations: int, length: usize): void {
+  if (iterations < 1 || length < 1) {
+    console.error("trap: pbkdf2: iterations and length must be positive");
+    const zero: int = 0;
+    const boom = 1 / zero;
+  }
+}
+
+// constantTimeEquals(a, b): bool -- equality of two byte strings. Visits every byte of equal-length inputs; inputs of different
+// length are unequal at once (their length is not a secret here: digests and MACs have fixed length).
+export function constantTimeEquals(a: Bytes, b: Bytes): bool {
+  if (a.length() != b.length()) {
+    return false;
+  }
+  let diff: int = 0;
+  let i: usize = 0;
+  while (i < a.length()) {
+    const x = a.at(i).toInt();
+    const y = b.at(i).toInt();
+    // x != y without a data-dependent branch: |x - y| > 0
+    diff += (x - y) * (x - y);
+    i += 1;
+  }
+  return diff == 0;
+}
+
+// constantTimeEqualsText(a, b): bool -- the same for two strings (their bytes). Different lengths are unequal at once.
+export function constantTimeEqualsText(a: string, b: string): bool {
+  return constantTimeEquals(fromString(a), fromString(b));
+}
+
+// base64UrlEncode(data): string -- RFC 4648 section 5 without padding.
+export function base64UrlEncode(data: Bytes): string {
+  return encoding.base64UrlEncode(data, encoding.Unpadded);
+}
+
+// base64Encode(data): string -- standard alphabet with padding (HTTP Basic credentials).
+export function base64Encode(data: Bytes): string {
+  return encoding.base64Encode(data, encoding.Padded);
+}
+
+// base64UrlDecode(text): Option<Bytes> -- strict (no padding, no whitespace, canonical).
+export function base64UrlDecode(text: string): Option<Bytes> {
+  const r = encoding.base64UrlDecodeText(text, encoding.Unpadded);
+  return r.isOk() ? Some(r.unwrap()) : None;
+}
+
+// hexEncode(data): string -- lower-case hex.
+export function hexEncode(data: Bytes): string {
+  return encoding.hexEncode(data);
+}
+
+// hexDecode(text): Option<Bytes>
+export function hexDecode(text: string): Option<Bytes> {
+  const r = encoding.hexDecodeText(text);
+  return r.isOk() ? Some(r.unwrap()) : None;
+}
+
+// text(data): the bytes as a string, byte for byte.
+export function bytesToText(data: Bytes): string {
+  return data.toRawString();
+}
+
+export function textToBytes(s: string): Bytes {
+  return fromString(s);
+}
+
+// pbkdf2DefaultIterations(): int -- the iteration count orin-auth uses for new password hashes. With this pure-Orin backend a
+// block of SHA-256 costs about 12 microseconds, so 20,000 iterations take about half a second. A native `std:crypto` makes
+// OWASP's 600,000 (PBKDF2-HMAC-SHA-256) affordable; change this one number then, or switch the default to argon2id.
+export function pbkdf2DefaultIterations(): int {
+  return 20000;
+}

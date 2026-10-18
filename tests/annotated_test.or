@@ -1,0 +1,91 @@
+// The annotation bridge: what the code generated for `@Use("authenticated, role:admin")` does is `useAll(mws, names, where, handler)`.
+// These tests call it the way the generated registration does.
+import { assert, assertEqString } from "std:test";
+import { Get } from "std:http";
+import {
+  Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertBody,
+  newMiddlewares, useAll, addRoute, Middlewares,
+} from "orin-web";
+import {
+  authMiddlewares, defaultAuthzConfig, authenticate, fixedClock, Authenticator, AuthOutcome,
+  AuthAnonymous, AuthPassed, noExtras, newPrincipal, ViaJwt, roleMiddlewareName,
+  scopeMiddlewareName, AUTHENTICATED, currentPrincipal,
+} from "../src/module";
+
+function fake(req: Request, now: int): AuthOutcome {
+  const h = req.header("x-test-user");
+  if (h.isNone()) {
+    return AuthAnonymous;
+  }
+  const parts = h.unwrap().split(":");
+  let roles: string[] = [];
+  if (parts.length > 1 && parts[1].length > 0) {
+    roles = parts[1].split("+");
+  }
+  let scopes: string[] = [];
+  if (parts.length > 2 && parts[2].length > 0) {
+    scopes = parts[2].split("+");
+  }
+  return AuthPassed(newPrincipal(parts[0], roles, scopes, ViaJwt), noExtras());
+}
+
+function registry(): Middlewares {
+  return authMiddlewares(newMiddlewares(), defaultAuthzConfig(), ["admin", "ops"], ["deploy"]);
+}
+
+function app(names: string): Router {
+  let r = new Router();
+  r.use(authenticate([fake], fixedClock(0)));
+  // what the generated registration does for a method annotated @Use(names)
+  const handler = useAll(
+    registry(),
+    names,
+    "Demo.method",
+    (req: Request): Result<Response, WebError> => {
+      const me = currentPrincipal(req)?;
+      return Ok(Response.text(200, "hi " + me.subject));
+    },
+  );
+  return addRoute(r, "GET", "/x", handler);
+}
+
+@Test
+function namesAreTheAnnotationsContract(): void {
+  assertEqString(roleMiddlewareName("admin"), "role:admin", "role");
+  assertEqString(scopeMiddlewareName("deploy"), "scope:deploy", "scope");
+  assertEqString(AUTHENTICATED, "authenticated", "authenticated");
+  assert(registry().has("auth"), "@Auth is @Use(\"auth\")");
+  assert(registry().has("authenticated"), "authenticated");
+  assert(registry().has("role:ops"), "every declared role");
+  assert(
+    !registry().has("role:root"),
+    "an undeclared role is NOT registered, so a typo fails at start-up",
+  );
+}
+
+@Test
+function useAuthenticated(): void {
+  const c = new TestClient(app("authenticated"));
+  assertStatus(c.get("/x"), 401);
+  assertBody(c.withHeader("X-Test-User", "ann").get("/x"), "hi ann");
+}
+
+@Test
+function useRoleAndScope(): void {
+  const admin = new TestClient(app("role:admin"));
+  assertStatus(admin.get("/x"), 401);
+  assertStatus(admin.withHeader("X-Test-User", "ann:ops").get("/x"), 403);
+  assertStatus(admin.withHeader("X-Test-User", "ann:admin").get("/x"), 200);
+  const deploy = new TestClient(app("scope:deploy"));
+  assertStatus(deploy.withHeader("X-Test-User", "ann:admin").get("/x"), 403);
+  assertStatus(deploy.withHeader("X-Test-User", "ann::deploy").get("/x"), 200);
+}
+
+@Test
+function severalNamesAreAllRequired(): void {
+  const both = new TestClient(app("authenticated, role:admin, scope:deploy"));
+  assertStatus(both.get("/x"), 401);
+  assertStatus(both.withHeader("X-Test-User", "a:admin").get("/x"), 403);
+  assertStatus(both.withHeader("X-Test-User", "a::deploy").get("/x"), 403);
+  assertStatus(both.withHeader("X-Test-User", "a:admin:deploy").get("/x"), 200);
+}

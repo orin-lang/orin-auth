@@ -1,0 +1,200 @@
+// Known-answer tests of the temporary crypto (internal/crypto.or). They live beside the code because tests/ cannot import
+// private files; run them with `orin test src/internal/crypto_test.or` (tools/ci.sh does). Vectors: FIPS 180-4 / NIST examples,
+// RFC 4231 (HMAC-SHA-256), RFC 7914 section 11 and the usual PBKDF2-HMAC-SHA-256 lists (checked against Python's hashlib).
+import { assert, assertEq, assertEqString, assertEqBool } from "std:test";
+import { Bytes, ByteBuilder, fromString, empty } from "std:bytes";
+import {
+  sha256, hmacSha256, pbkdf2HmacSha256, constantTimeEquals, constantTimeEqualsText, hexEncode,
+  hexDecode, base64UrlEncode, base64UrlDecode,
+} from "./crypto";
+
+function rep(s: string, n: usize): Bytes {
+  let unit = "";
+  let i: usize = 0;
+  while (i < n && i < 1000) {
+    unit = unit + s;
+    i += 1;
+  }
+  let b = new ByteBuilder();
+  let left = n;
+  while (left > 0) {
+    const step = left > 1000 ? 1000 : left;
+    b.appendString(unit.substring(0, step * s.length));
+    left -= step;
+  }
+  return b.build();
+}
+
+function hex(s: string): Bytes {
+  return hexDecode(s).unwrap();
+}
+
+@Test
+function sha256Empty(): void {
+  assertEqString(
+    hexEncode(sha256(empty())),
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "empty",
+  );
+}
+
+@Test
+function sha256Abc(): void {
+  assertEqString(
+    hexEncode(sha256(fromString("abc"))),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    "abc",
+  );
+}
+
+@Test
+function sha256TwoBlockMessage(): void {
+  const m = fromString("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+  assertEqString(
+    hexEncode(sha256(m)),
+    "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+    "448 bits",
+  );
+}
+
+@Test
+function sha256PaddingBoundaries(): void {
+  assertEqString(
+    hexEncode(sha256(rep("a", 55))),
+    "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+    "55 bytes: one block",
+  );
+  assertEqString(
+    hexEncode(sha256(rep("a", 56))),
+    "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+    "56 bytes: length spills to a second block",
+  );
+  assertEqString(
+    hexEncode(sha256(rep("a", 64))),
+    "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+    "64 bytes",
+  );
+  assertEqString(
+    hexEncode(sha256(rep("a", 119))),
+    "31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb",
+    "119 bytes",
+  );
+}
+
+@Test
+function sha256MillionA(): void {
+  assertEqString(
+    hexEncode(sha256(rep("a", 1000000))),
+    "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+    "1,000,000 x a",
+  );
+}
+
+@Test
+function hmacRfc4231(): void {
+  assertEqString(
+    hexEncode(hmacSha256(rep("\x0b", 20), fromString("Hi There"))),
+    "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+    "case 1",
+  );
+  assertEqString(
+    hexEncode(hmacSha256(fromString("Jefe"), fromString("what do ya want for nothing?"))),
+    "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+    "case 2",
+  );
+}
+
+@Test
+function hmacLongKeyIsHashedFirst(): void {
+  const key = rep("\xaa", 131);
+  assertEqString(
+    hexEncode(
+      hmacSha256(key, fromString("Test Using Larger Than Block-Size Key - Hash Key First")),
+    ),
+    "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+    "case 6",
+  );
+  assertEqString(
+    hexEncode(
+      hmacSha256(
+        key,
+        fromString(
+          "This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.",
+        ),
+      ),
+    ),
+    "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2",
+    "case 7",
+  );
+}
+
+@Test
+function pbkdf2Vectors(): void {
+  const p = fromString("password");
+  const s = fromString("salt");
+  assertEqString(
+    hexEncode(pbkdf2HmacSha256(p, s, 1, 32)),
+    "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
+    "c=1",
+  );
+  assertEqString(
+    hexEncode(pbkdf2HmacSha256(p, s, 2, 32)),
+    "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43",
+    "c=2",
+  );
+  assertEqString(
+    hexEncode(pbkdf2HmacSha256(p, s, 4096, 32)),
+    "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+    "c=4096",
+  );
+}
+
+@Test
+function pbkdf2MultiBlockOutput(): void {
+  assertEqString(
+    hexEncode(
+      pbkdf2HmacSha256(
+        fromString("passwordPASSWORDpassword"),
+        fromString("saltSALTsaltSALTsaltSALTsaltSALTsalt"),
+        4096,
+        40,
+      ),
+    ),
+    "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9",
+    "dkLen 40",
+  );
+  // RFC 7914 section 11
+  assertEqString(
+    hexEncode(pbkdf2HmacSha256(fromString("passwd"), fromString("salt"), 1, 64)),
+    "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783",
+    "RFC 7914 vector 1",
+  );
+}
+
+@Test
+function constantTimeEqualsAgrees(): void {
+  assertEqBool(constantTimeEquals(fromString("abc"), fromString("abc")), true, "equal");
+  assertEqBool(constantTimeEquals(fromString("abc"), fromString("abd")), false, "last byte");
+  assertEqBool(constantTimeEquals(fromString("abc"), fromString("bbc")), false, "first byte");
+  assertEqBool(constantTimeEquals(fromString("abc"), fromString("abcd")), false, "length");
+  assertEqBool(constantTimeEquals(empty(), empty()), true, "empty");
+  assertEqBool(constantTimeEqualsText("tok", "tok"), true, "text");
+  assertEqBool(constantTimeEqualsText("tok", "tol"), false, "text differs");
+}
+
+@Test
+function base64UrlRoundTrip(): void {
+  assertEqString(base64UrlEncode(hex("fbff")), "-_8", "url alphabet, no padding");
+  assertEqString(
+    base64UrlEncode(fromString("any carnal pleas")),
+    "YW55IGNhcm5hbCBwbGVhcw",
+    "no padding",
+  );
+  assert(
+    base64UrlDecode("YW55IGNhcm5hbCBwbGVhcw").unwrap().equals(fromString("any carnal pleas")),
+    "decode",
+  );
+  assert(base64UrlDecode("YW55IGNhcm5hbCBwbGVhcw==").isNone(), "padding is refused");
+  assert(base64UrlDecode("+/8").isNone(), "standard alphabet is refused");
+  assert(base64UrlDecode("a b").isNone(), "whitespace is refused");
+}

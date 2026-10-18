@@ -1,0 +1,141 @@
+// Principal: who a request is made by, as established by an authenticator (session cookie, API token, JWT, OIDC login) and
+// read by the authorization middleware and by handlers.
+//
+// A principal travels with the request as a request ATTRIBUTE (`Request.withAttr`), which only server code can set: a client
+// cannot forge it with a header, because attributes are not parsed from the wire. The attribute holds a compact percent-encoded
+// form, `principalOf(req)` decodes it.
+import { PercentSpace, percentEncode, percentDecode } from "std:url";
+import { Request } from "orin-web";
+
+// How the principal was authenticated. `ViaSession` is the only method that rides on a browser cookie, and therefore the only
+// one CSRF protection applies to.
+export type AuthMethod = ViaSession | ViaApiToken | ViaJwt | ViaOidc | ViaOther;
+
+// subject: a stable user id (never an e-mail address that can change). roles: coarse groups ("admin"). scopes: fine permissions
+// ("deploy", "read:projects"). Role and scope names are compared exactly, case-sensitively.
+export type Principal = { subject: string; roles: string[]; scopes: string[]; method: AuthMethod; };
+
+export function authMethodName(m: AuthMethod): string {
+  return match (m) {
+    ViaSession => "session",
+    ViaApiToken => "api-token",
+    ViaJwt => "jwt",
+    ViaOidc => "oidc",
+    ViaOther => "other",
+  };
+}
+
+function authMethodOf(name: string): AuthMethod {
+  if (name == "session") {
+    return ViaSession;
+  }
+  if (name == "api-token") {
+    return ViaApiToken;
+  }
+  if (name == "jwt") {
+    return ViaJwt;
+  }
+  if (name == "oidc") {
+    return ViaOidc;
+  }
+  return ViaOther;
+}
+
+// newPrincipal(subject, roles, scopes, method)
+export function newPrincipal(
+  subject: string,
+  roles: string[],
+  scopes: string[],
+  method: AuthMethod,
+): Principal {
+  return Principal { subject: subject, roles: roles, scopes: scopes, method: method };
+}
+
+export function hasRole(p: Principal, role: string): bool {
+  return p.roles.includes(role);
+}
+
+export function hasScope(p: Principal, scope: string): bool {
+  return p.scopes.includes(scope);
+}
+
+// hasAnyRole(p, roles): bool -- at least one of `roles` (false for an empty list).
+export function hasAnyRole(p: Principal, roles: string[]): bool {
+  for (const r of roles) {
+    if (p.roles.includes(r)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// hasAllScopes(p, scopes): bool -- every one of `scopes` (true for an empty list).
+export function hasAllScopes(p: Principal, scopes: string[]): bool {
+  for (const s of scopes) {
+    if (!p.scopes.includes(s)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function encodeList(xs: string[]): string {
+  let out = "";
+  let first = true;
+  for (const x of xs) {
+    out = out + (first ? "" : ",") + percentEncode(x, PercentSpace);
+    first = false;
+  }
+  return out;
+}
+
+function decodeList(s: string): string[] {
+  let out: string[] = [];
+  if (s.length == 0) {
+    return out;
+  }
+  for (const part of s.split(",")) {
+    const d = percentDecode(part, PercentSpace);
+    if (d.isOk()) {
+      out.push(d.unwrap());
+    }
+  }
+  return out;
+}
+
+const PRINCIPAL_ATTR: string = "auth.principal";
+
+// withPrincipal(req, p): Request -- a copy of `req` that carries `p`. Replaces an earlier principal.
+export function withPrincipal(req: Request, p: Principal): Request {
+  const text = authMethodName(p.method) + "|" + percentEncode(p.subject, PercentSpace) + "|"
+      + encodeList(p.roles) + "|" + encodeList(p.scopes);
+  return req.withAttr(PRINCIPAL_ATTR, text);
+}
+
+// withoutPrincipal(req): Request -- a copy of `req` that carries no principal (used before authenticators run, so that a
+// principal set by earlier code cannot leak into a different authentication decision).
+export function withoutPrincipal(req: Request): Request {
+  return req.withAttr(PRINCIPAL_ATTR, "");
+}
+
+// principalOf(req): Option<Principal> -- the principal an authentication middleware attached, or None for an anonymous request.
+export function principalOf(req: Request): Option<Principal> {
+  const a = req.attr(PRINCIPAL_ATTR);
+  if (a.isNone() || a.unwrap().length == 0) {
+    return None;
+  }
+  const parts = a.unwrap().split("|");
+  if (parts.length != 4) {
+    return None;
+  }
+  const subject = percentDecode(parts[1], PercentSpace);
+  if (subject.isErr()) {
+    return None;
+  }
+  return Some(Principal {
+    subject: subject.unwrap(),
+    roles: decodeList(parts[2]),
+    scopes: decodeList(parts[3]),
+    method: authMethodOf(parts[0]),
+  });
+}

@@ -1,0 +1,259 @@
+// TEMPORARY: SHA-256 (FIPS 180-4) in plain Orin, to be replaced by `std:crypto` as soon as it lands (see internal/crypto.or).
+//
+// Orin has no bitwise operators and no shifts, so the 32-bit words are `int`s in 0 .. 2^32-1 and
+//   * rotation and shifts are `/`, `%` and `*` by powers of two,
+//   * XOR is a 64K-entry byte table (built once per top-level call), four lookups per word,
+//   * AND comes from XOR:  a & b == (a + b - (a ^ b)) / 2.
+// This is the textbook algorithm, nothing else: no new construction. It is not constant-time with respect to cache
+// effects (table lookups), which does not matter for the public inputs it is used on here (tokens are random, MACs are
+// compared separately in constant time); `std:crypto` removes the question.
+import { Bytes, ByteBuilder, fromArray } from "std:bytes";
+
+const TWO32: int = 4294967296;
+
+// xorTable(): int[] -- t[a * 256 + b] == a ^ b for bytes a, b. 64K entries; built by the recurrence
+// x(a, b) = 2 * x(a / 2, b / 2) + (a % 2 != b % 2), in order of the bit length of max(a, b).
+export function xorTable(): int[] {
+  let t: int[] = [];
+  let i: int = 0;
+  while (i < 65536) {
+    t.push(0);
+    i += 1;
+  }
+  let k: int = 1;
+  while (k <= 128) {
+    let a: int = 0;
+    while (a < 2 * k) {
+      let b: int = 0;
+      while (b < 2 * k) {
+        if (a >= k || b >= k) {
+          t[(a * 256 + b).toUsize()] = t[(a / 2 * 256 + b / 2).toUsize()] * 2
+              + (a % 2 != b % 2 ? 1 : 0);
+        }
+        b += 1;
+      }
+      a += 1;
+    }
+    k = k * 2;
+  }
+  return t;
+}
+
+// x32(t, a, b): int -- a ^ b for 0 <= a, b < 2^32.
+export function x32(t: int[], a: int, b: int): int {
+  return t[(a % 256 * 256 + b % 256).toUsize()]
+      + 256 * t[(a / 256 % 256 * 256 + b / 256 % 256).toUsize()]
+      + 65536 * t[(a / 65536 % 256 * 256 + b / 65536 % 256).toUsize()]
+      + 16777216 * t[(a / 16777216 * 256 + b / 16777216).toUsize()];
+}
+
+// x3(t, a, b, c): int -- a ^ b ^ c, one lane at a time (saves the recombination of an intermediate word).
+export function x3(t: int[], a: int, b: int, c: int): int {
+  const a0 = a % 256;
+  const a1 = a / 256 % 256;
+  const a2 = a / 65536 % 256;
+  const a3 = a / 16777216;
+  return t[(t[(a0 * 256 + b % 256).toUsize()] * 256 + c % 256).toUsize()]
+      + 256 * t[(t[(a1 * 256 + b / 256 % 256).toUsize()] * 256 + c / 256 % 256).toUsize()]
+      + 65536 * t[(t[(a2 * 256 + b / 65536 % 256).toUsize()] * 256 + c / 65536 % 256).toUsize()]
+      + 16777216 * t[(t[(a3 * 256 + b / 16777216).toUsize()] * 256 + c / 16777216).toUsize()];
+}
+
+// a & b for 0 <= a, b < 2^32.
+function and32(t: int[], a: int, b: int): int {
+  return (a + b - x32(t, a, b)) / 2;
+}
+
+// Rotate right by n (0 < n < 32): p = 2^n.
+function rotr(x: int, p: int, q: int): int {
+  return x / p + x % p * q;
+}
+
+function roundConstants(): int[] {
+  return [
+    1116352408,
+    1899447441,
+    3049323471,
+    3921009573,
+    961987163,
+    1508970993,
+    2453635748,
+    2870763221,
+    3624381080,
+    310598401,
+    607225278,
+    1426881987,
+    1925078388,
+    2162078206,
+    2614888103,
+    3248222580,
+    3835390401,
+    4022224774,
+    264347078,
+    604807628,
+    770255983,
+    1249150122,
+    1555081692,
+    1996064986,
+    2554220882,
+    2821834349,
+    2952996808,
+    3210313671,
+    3336571891,
+    3584528711,
+    113926993,
+    338241895,
+    666307205,
+    773529912,
+    1294757372,
+    1396182291,
+    1695183700,
+    1986661051,
+    2177026350,
+    2456956037,
+    2730485921,
+    2820302411,
+    3259730800,
+    3345764771,
+    3516065817,
+    3600352804,
+    4094571909,
+    275423344,
+    430227734,
+    506948616,
+    659060556,
+    883997877,
+    958139571,
+    1322822218,
+    1537002063,
+    1747873779,
+    1955562222,
+    2024104815,
+    2227730452,
+    2361852424,
+    2428436474,
+    2756734187,
+    3204031479,
+    3329325298,
+  ];
+}
+
+// The initial hash value H(0).
+export function sha256Init(): int[] {
+  return [
+    1779033703,
+    3144134277,
+    1013904242,
+    2773480762,
+    1359893119,
+    2600822924,
+    528734635,
+    1541459225,
+  ];
+}
+
+// compressBlocks(t, h, data): int[] -- the state after the complete 64-byte blocks of `data` (a trailing partial block is
+// ignored). `t` is the XOR table.
+export function compressBlocks(t: int[], h0: int[], data: Bytes): int[] {
+  const k = roundConstants();
+  let h = h0;
+  let off: usize = 0;
+  while (off + 64 <= data.length()) {
+    let w: int[] = [];
+    let j: usize = 0;
+    while (j < 16) {
+      const p = off + j * 4;
+      w.push(
+        data.at(p).toInt() * 16777216 + data.at(p + 1).toInt() * 65536
+            + data.at(p + 2).toInt() * 256 + data.at(p + 3).toInt(),
+      );
+      j += 1;
+    }
+    while (j < 64) {
+      const w15 = w[j - 15];
+      const w2 = w[j - 2];
+      // s0 = rotr7 ^ rotr18 ^ shr3 ; s1 = rotr17 ^ rotr19 ^ shr10
+      const s0 = x3(t, rotr(w15, 128, 33554432), rotr(w15, 262144, 16384), w15 / 8);
+      const s1 = x3(t, rotr(w2, 131072, 32768), rotr(w2, 524288, 8192), w2 / 1024);
+      w.push((w[j - 16] + s0 + w[j - 7] + s1) % TWO32);
+      j += 1;
+    }
+    let a = h[0];
+    let b = h[1];
+    let c = h[2];
+    let d = h[3];
+    let e = h[4];
+    let f = h[5];
+    let g = h[6];
+    let hh = h[7];
+    let i: usize = 0;
+    while (i < 64) {
+      // S1 = rotr6 ^ rotr11 ^ rotr25 ; ch = (e & f) + (~e & g) = (e & f) + g - (e & g)
+      const bigS1 = x3(t, rotr(e, 64, 67108864), rotr(e, 2048, 2097152), rotr(e, 33554432, 128));
+      const ch = and32(t, e, f) + g - and32(t, e, g);
+      const t1 = (hh + bigS1 + ch + k[i] + w[i]) % TWO32;
+      // S0 = rotr2 ^ rotr13 ^ rotr22 ; maj = (a & b) + (c & (a ^ b)), with a ^ b = a + b - 2 (a & b)
+      const bigS0 = x3(t, rotr(a, 4, 1073741824), rotr(a, 8192, 524288), rotr(a, 4194304, 1024));
+      const ab = and32(t, a, b);
+      const maj = ab + and32(t, c, a + b - 2 * ab);
+      const t2 = (bigS0 + maj) % TWO32;
+      hh = g;
+      g = f;
+      f = e;
+      e = (d + t1) % TWO32;
+      d = c;
+      c = b;
+      b = a;
+      a = (t1 + t2) % TWO32;
+      i += 1;
+    }
+    h = [
+      (h[0] + a) % TWO32,
+      (h[1] + b) % TWO32,
+      (h[2] + c) % TWO32,
+      (h[3] + d) % TWO32,
+      (h[4] + e) % TWO32,
+      (h[5] + f) % TWO32,
+      (h[6] + g) % TWO32,
+      (h[7] + hh) % TWO32,
+    ];
+    off += 64;
+  }
+  return h;
+}
+
+// The 32-byte big-endian digest of a state.
+export function digestOf(h: int[]): Bytes {
+  let out: u8[] = [];
+  for (const x of h) {
+    out.push((x / 16777216).toU8());
+    out.push((x / 65536 % 256).toU8());
+    out.push((x / 256 % 256).toU8());
+    out.push((x % 256).toU8());
+  }
+  return fromArray(out);
+}
+
+// sha256Finish(t, h, rest, priorBytes): Bytes -- finishes a hash whose state `h` already absorbed `priorBytes` bytes (a multiple
+// of 64) by absorbing `rest` and the padding of FIPS 180-4 5.1.1.
+export function sha256Finish(t: int[], h: int[], rest: Bytes, priorBytes: usize): Bytes {
+  const total = priorBytes + rest.length();
+  let b = new ByteBuilder();
+  b.appendBytes(rest);
+  b.appendU8(128);
+  while ((b.length() + 8) % 64 != 0) {
+    b.appendU8(0);
+  }
+  // 64-bit big-endian bit length
+  const bits: int = total.toInt() * 8;
+  b.appendU32Be((bits / TWO32).toU32());
+  b.appendU32Be((bits % TWO32).toU32());
+  return digestOf(compressBlocks(t, h, b.build()));
+}
+
+// sha256With(t, data): Bytes -- SHA-256 with a prepared XOR table.
+export function sha256With(t: int[], data: Bytes): Bytes {
+  const full = data.length() / 64 * 64;
+  const h = compressBlocks(t, sha256Init(), data.slice(0, full));
+  return sha256Finish(t, h, data.slice(full, data.length()), full);
+}

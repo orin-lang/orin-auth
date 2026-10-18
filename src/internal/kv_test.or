@@ -1,0 +1,34 @@
+import { assert, assertEq, assertEqString, assertEqBool } from "std:test";
+import { scope } from "std:task";
+import { startKv } from "./kv";
+
+@Test
+function putGetRemoveSweep(): void {
+  scope(s => {
+    const kv = startKv<string>(s);
+    assertEqBool(kv.put("a", "1"), true, "put");
+    kv.put("b", "22");
+    kv.put("c", "333");
+    assertEqString(kv.get("a").unwrap(), "1", "get");
+    assert(kv.get("zz").isNone(), "absent");
+    assertEq(kv.count(), 3, "count");
+    assertEqBool(kv.remove("a"), true, "remove present");
+    assertEqBool(kv.remove("a"), false, "remove absent");
+    assertEq(kv.sweep((v: string): bool => v.length > 2), 1, "sweep");
+    assertEq(kv.count(), 1, "left");
+    kv.close();
+  });
+}
+
+@Test
+function updateIsAReadModifyWrite(): void {
+  scope(s => {
+    const kv = startKv<int>(s);
+    const bump = (cur: Option<int>): Option<int> => Some(cur.unwrapOr(0) + 1);
+    assertEq(kv.update("n", bump).unwrap(), 1, "created");
+    assertEq(kv.update("n", bump).unwrap(), 2, "incremented");
+    assert(kv.update("n", (cur: Option<int>): Option<int> => None).isNone(), "removed");
+    assert(kv.get("n").isNone(), "gone");
+    kv.close();
+  });
+}

@@ -1,0 +1,162 @@
+// An in-memory key-value store that lives in ONE task (the "owner task" pattern of orin-web: tasks share no mutable state, so state
+// is owned by a task and reached through a channel; one command at a time makes every operation atomic). Generic in the value type;
+// sessions, API tokens and rate-limit buckets use it.
+import { Sender, Receiver, Scope, TaskHandle, channel, spawn } from "std:task";
+
+type Cmd<V> =
+  Get(string, Sender<Option<V>>)
+  | Put(string, V, Sender<bool>)
+  | Remove(string, Sender<bool>)
+  | Update(string, (cur: Option<V>) => Option<V>, Sender<Option<V>>)
+  | Sweep((v: V) => bool, Sender<int>)
+  | Count(Sender<int>);
+
+// Runs until the command channel is closed and drained.
+function ownerLoop<V>(rx: Receiver<Cmd<V>>): int {
+  let items = new Map<string, V>();
+  let handled: int = 0;
+  let going = true;
+  while (going) {
+    match (rx.recv()) {
+      Some(c) => {
+        match (c) {
+          Get(k, reply) => {
+            reply.send(items.get(k));
+          },
+          Put(k, v, reply) => {
+            items.set(k, v);
+            reply.send(true);
+          },
+          Remove(k, reply) => {
+            const had = items.has(k);
+            items.delete(k);
+            reply.send(had);
+          },
+          Update(k, f, reply) => {
+            const next = f(items.get(k));
+            if (next.isSome()) {
+              items.set(k, next.unwrap());
+            } else {
+              items.delete(k);
+            }
+            reply.send(next);
+          },
+          Sweep(pred, reply) => {
+            let dead: string[] = [];
+            for (const k of items.keys()) {
+              if (pred(items.get(k).unwrap())) {
+                dead.push(k);
+              }
+            }
+            for (const k of dead) {
+              items.delete(k);
+            }
+            reply.send(dead.length.toInt());
+          },
+          Count(reply) => {
+            reply.send(items.size.toInt());
+          },
+        }
+        handled += 1;
+      },
+      None => {
+        going = false;
+      },
+    }
+  }
+  return handled;
+}
+
+// A handle on a running owner task. Copyable, so a closure may capture it.
+export class KvHandle<V> {
+  private tx: Sender<Cmd<V>>;
+
+  constructor(tx: Sender<Cmd<V>>) {
+    this.tx = tx;
+  }
+
+  get(key: string): Option<V> {
+    const r = channel<Option<V>>(1);
+    if (this.tx.send(Get(key, r.tx)).isErr()) {
+      return None;
+    }
+    const got = r.rx.recv();
+    r.rx.close();
+    r.tx.close();
+    return got.isSome() ? got.unwrap() : None;
+  }
+
+  // put(key, value): bool -- false when the owner is gone.
+  put(key: string, value: V): bool {
+    const r = channel<bool>(1);
+    if (this.tx.send(Put(key, value, r.tx)).isErr()) {
+      return false;
+    }
+    const got = r.rx.recv();
+    r.rx.close();
+    r.tx.close();
+    return got.unwrapOr(false);
+  }
+
+  // remove(key): bool -- true when the key was present.
+  remove(key: string): bool {
+    const r = channel<bool>(1);
+    if (this.tx.send(Remove(key, r.tx)).isErr()) {
+      return false;
+    }
+    const got = r.rx.recv();
+    r.rx.close();
+    r.tx.close();
+    return got.unwrapOr(false);
+  }
+
+  // update(key, f): Option<V> -- atomically replaces the value of `key` with `f(current)` (None removes the key) and answers the new
+  // value. `f` runs inside the owner task, so a read-modify-write cannot interleave with another task's. `f` captures values only.
+  // None also when the owner is gone.
+  update(key: string, f: (cur: Option<V>) => Option<V>): Option<V> {
+    const r = channel<Option<V>>(1);
+    if (this.tx.send(Update(key, f, r.tx)).isErr()) {
+      return None;
+    }
+    const got = r.rx.recv();
+    r.rx.close();
+    r.tx.close();
+    return got.isSome() ? got.unwrap() : None;
+  }
+
+  // sweep(pred): int -- removes every entry whose value satisfies `pred`; the number removed.
+  sweep(pred: (v: V) => bool): int {
+    const r = channel<int>(1);
+    if (this.tx.send(Sweep(pred, r.tx)).isErr()) {
+      return 0;
+    }
+    const got = r.rx.recv();
+    r.rx.close();
+    r.tx.close();
+    return got.unwrapOr(0);
+  }
+
+  count(): int {
+    const r = channel<int>(1);
+    if (this.tx.send(Count(r.tx)).isErr()) {
+      return 0;
+    }
+    const got = r.rx.recv();
+    r.rx.close();
+    r.tx.close();
+    return got.unwrapOr(0);
+  }
+
+  // close(): the owner finishes after the commands already queued.
+  close(): void {
+    this.tx.close();
+  }
+}
+
+// startKv<V>(s): KvHandle<V> -- starts the owner task in scope `s`. Call `close()` before the scope ends or the scope waits forever.
+export function startKv<V>(s: Scope): KvHandle<V> {
+  const cmds = channel<Cmd<V>>(256);
+  const rx = cmds.rx;
+  spawn(s, () => ownerLoop<V>(rx));
+  return new KvHandle<V>(cmds.tx);
+}

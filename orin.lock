@@ -1,0 +1,2 @@
+# Orin lock v1: name|kind|source|selector|commit
+orin-web|git|https://github.com/orin-lang/orin-web|50f69905bbdb44451a396bb8596f45462fd62fb0|50f69905bbdb44451a396bb8596f45462fd62fb0

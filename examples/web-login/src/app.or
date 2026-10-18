@@ -1,0 +1,210 @@
+// web-login: an orin-web application protected with orin-auth.
+//
+//   GET  /                public page
+//   GET  /login           login form (carries a CSRF token)
+//   POST /login           form login: rate limited, password verified (and upgraded), new session
+//   POST /logout          ends the session (CSRF protected)
+//   GET  /me              any logged-in user                     (browser: redirect to /login; API: 401 JSON)
+//   GET  /admin           role "admin"                           (403 for other users)
+//   POST /api/deploy      scope "deploy", with a session or an API token:  Authorization: Bearer demo_<id>_<secret>
+//
+// `buildApp` takes everything it needs as values, so the tests drive it with a TestClient and no network.
+import { PlusAsSpace, QueryPair, parseQuery } from "std:url";
+import { JsonValue } from "std:json";
+import {
+  SessionManager, ApiTokenStore, RateLimiter, CsrfProtection, NowFn, RandomFn, PasswordPolicy,
+  authenticate, sessionAuthenticator, apiTokenAuthenticator, rateLimit, requireAuthenticated,
+  requireRole, requireScope, mixedAuthzConfig, AuthzConfig, currentPrincipal, verifyAndUpgrade,
+  hashPassword, dummyVerify, PasswordRejected, PasswordAccepted, PasswordAcceptedRehashed, safeNext,
+  passwordErrorMessage, hasScope, Router, Request, Response, WebError, Handler, withMiddleware,
+  jsonObject, jsonMember, jsonString, jsonArray, badRequest, unauthorized, internalError,
+  statusError, logger, forbidden,
+} from "orin-auth";
+
+// A user record: in a real application this is a database row.
+export type User = { name: string; phc: string; roles: string[]; scopes: string[]; };
+
+export type AppDeps = {
+  sessions: SessionManager;
+  tokens: ApiTokenStore;
+  limiter: RateLimiter;
+  csrf: CsrfProtection;
+  now: NowFn;
+  random: RandomFn;
+  policy: PasswordPolicy;
+  users: User[];
+  secureCookies: bool;
+};
+
+function findUser(users: User[], name: string): Option<User> {
+  for (const u of users) {
+    if (u.name == name) {
+      return Some(u);
+    }
+  }
+  return None;
+}
+
+function formField(req: Request, name: string): string {
+  const text = req.bodyText();
+  if (text.isErr()) {
+    return "";
+  }
+  const q = parseQuery(text.unwrap(), PlusAsSpace);
+  if (q.isErr()) {
+    return "";
+  }
+  for (const kv of q.unwrap()) {
+    if (kv.key == name) {
+      return kv.value;
+    }
+  }
+  return "";
+}
+
+function page(title: string, body: string): Response {
+  return Response.html(
+    200,
+    "<!doctype html><title>" + title + "</title><h1>" + title + "</h1>" + body,
+  );
+}
+
+function escape(s: string): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.substring(i, i + 1);
+    out = out
+        + (c == "<" ? "&lt;" : c == ">" ? "&gt;" : c == "&" ? "&amp;" : c == "\"" ? "&quot;" : c);
+    i += 1;
+  }
+  return out;
+}
+
+function loginForm(deps: AppDeps, req: Request): Result<Response, WebError> {
+  const token = deps.csrf.token(req);
+  if (token.isErr()) {
+    return Err(internalError("cannot issue a CSRF token"));
+  }
+  const next = req.query("next").unwrapOr("/me");
+  return Ok(
+    page(
+      "Sign in",
+      "<form method=post action=/login><input type=hidden name=csrf_token value=\"" + token.unwrap()
+          + "\">" + "<input type=hidden name=next value=\"" + escape(safeNext(next, "/me")) + "\">"
+          + "<label>User <input name=user></label> <label>Password <input name=password type=password></label>"
+          + "<button>Sign in</button></form>",
+    ),
+  );
+}
+
+function login(deps: AppDeps, req: Request): Result<Response, WebError> {
+  const name = formField(req, "user");
+  const password = formField(req, "password");
+  const user = findUser(deps.users, name);
+  const now = deps.now();
+  // Unknown user and wrong password take the same time and give the same answer.
+  if (user.isNone()) {
+    dummyVerify(password, deps.policy);
+    return Err(unauthorized("invalid user or password"));
+  }
+  const checked = verifyAndUpgrade(password, user.unwrap().phc, deps.policy, deps.random);
+  if (checked.isErr()) {
+    return Err(
+      internalError("password check failed: " + passwordErrorMessage(checked.unwrapErr())),
+    );
+  }
+  match (checked.unwrap()) {
+    PasswordRejected => {
+      return Err(unauthorized("invalid user or password"));
+    },
+    PasswordAcceptedRehashed(fresh) => {
+      // store `fresh` as the user's new hash here (a database update); the demo keeps users in memory
+    },
+    PasswordAccepted => {},
+  }
+  deps.limiter.reset("login:" + name);
+  const made = deps.sessions.login(
+    req,
+    now,
+    user.unwrap().name,
+    user.unwrap().roles,
+    user.unwrap().scopes,
+  );
+  if (made.isErr()) {
+    return Err(internalError("cannot create a session"));
+  }
+  const target = safeNext(formField(req, "next"), "/me");
+  const res = Response.redirect(303, target)?;
+  return Ok(res.withAddedHeader("Set-Cookie", made.unwrap().setCookie));
+}
+
+function logout(deps: AppDeps, req: Request): Result<Response, WebError> {
+  const clear = deps.sessions.logout(req);
+  if (clear.isErr()) {
+    return Err(internalError("cannot clear the cookie"));
+  }
+  const res = Response.redirect(303, "/")?;
+  return Ok(res.withAddedHeader("Set-Cookie", clear.unwrap()));
+}
+
+function me(req: Request): Result<Response, WebError> {
+  const p = currentPrincipal(req)?;
+  return Response.json(
+    200,
+    jsonObject([
+      jsonMember("subject", jsonString(p.subject)),
+      jsonMember("roles", jsonArray(p.roles.map(r => jsonString(r)))),
+      jsonMember("scopes", jsonArray(p.scopes.map(s => jsonString(s)))),
+    ]),
+  );
+}
+
+export function buildApp(deps: AppDeps): Router {
+  const authz = mixedAuthzConfig("/login");
+  let app = new Router();
+  // order matters: who is it, is the request forged, how often
+  app.use(
+    authenticate(
+      [apiTokenAuthenticator(deps.tokens, "demo"), sessionAuthenticator(deps.sessions)],
+      deps.now,
+    ),
+  );
+  app.use(deps.csrf.middleware());
+  app.get(
+    "/",
+    (req: Request): Result<Response, WebError> => Ok(page("Welcome", "<a href=/login>Sign in</a>")),
+  );
+  app.get("/login", (req: Request): Result<Response, WebError> => loginForm(deps, req));
+  app.post(
+    "/login",
+    withMiddleware(
+      rateLimit(
+        deps.limiter,
+        (req: Request): Option<string> => Some("login:" + formField(req, "user")),
+        deps.now,
+      ),
+      (req: Request): Result<Response, WebError> => login(deps, req),
+    ),
+  );
+  app.post("/logout", (req: Request): Result<Response, WebError> => logout(deps, req));
+  app.get("/me", withMiddleware(requireAuthenticated(authz), me));
+  app.get(
+    "/admin",
+    withMiddleware(
+      requireRole(authz, "admin"),
+      (req: Request): Result<Response, WebError> => Ok(page("Admin", "only admins see this")),
+    ),
+  );
+  app.post(
+    "/api/deploy",
+    withMiddleware(
+      requireScope(authz, "deploy"),
+      (req: Request): Result<Response, WebError> => Response.json(
+        202,
+        jsonObject([jsonMember("status", jsonString("deploying"))]),
+      ),
+    ),
+  );
+  return app;
+}

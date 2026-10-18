@@ -1,0 +1,517 @@
+// JSON Web Tokens (RFC 7519) with JWS compact serialization (RFC 7515): HS256 signing and verification, and a hook for the
+// asymmetric algorithms (RS256, ES256) that need `std:crypto`.
+//
+// What is checked, in this order (a failure stops at the first):
+//   1. size (<= maxTokenBytes) and shape: exactly three base64url parts, no padding, canonical encoding.
+//   2. the header: a JSON object (no duplicate keys), with `alg` a string. `crit` is refused (no extensions are implemented).
+//      Header fields that name keys or URLs (`jwk`, `jku`, `x5u`, `x5c`) are NEVER used: keys come only from the verifier's key
+//      set, so a token cannot supply its own verification key.
+//   3. the algorithm: `alg` must be exactly "HS256", "RS256" or "ES256" (anything else, including "none" in any spelling, is
+//      refused, and "none" is reported as its own error), must be in the options' allow-list, and must be the algorithm the
+//      SELECTED KEY is for. This is what stops algorithm confusion: a public key can never be used as an HMAC secret, because
+//      a key knows its algorithm; the token's header does not choose it.
+//   4. the key: selected by `kid` from the key set.
+//   5. the signature, constant-time. Only now is the payload parsed, so unauthenticated input reaches no further code.
+//   6. the claims: exp (required unless disabled), nbf, iss, aud, with `leewaySeconds` of clock skew. NumericDates must be integers.
+//
+// RS256 / ES256: verification needs RSA / ECDSA from `std:crypto`. DEFERRED. The key set accepts `JwtExternalKey(kid, alg, verifier)`
+// where `verifier(signingInput, signature) -> bool` is supplied by the application (or by std:crypto when it exists); everything
+// else (header, kid, alg checks, claims) is shared. Signing with RS256 / ES256 is out of scope.
+import { Bytes, fromString } from "std:bytes";
+import {
+  JsonValue, JsonMember, ValueNull, ValueBool, ValueNumber, ValueString, ValueArray, ValueObject,
+  parseDocument, writeDocument, defaultReadOptions, defaultLimits,
+} from "std:json";
+import { numberFromInt, numberAsInt } from "std:json/number";
+import { toLowerAscii } from "std:http";
+import { Request } from "orin-web";
+import { AuthError, authError, ConfigInvalid, InputInvalid, FeatureUnsupported } from "./error";
+import { Principal, ViaJwt } from "./principal";
+import {
+  AuthOutcome, AuthAnonymous, AuthPassed, AuthFailed, Authenticator, noExtras,
+} from "./authn";
+import {
+  hmacSha256, constantTimeEquals, base64UrlEncode, base64UrlDecode, textToBytes, bytesToText,
+} from "./internal/crypto";
+
+export type JwtAlg = JwtHS256 | JwtRS256 | JwtES256;
+
+export function jwtAlgName(a: JwtAlg): string {
+  return match (a) {
+    JwtHS256 => "HS256",
+    JwtRS256 => "RS256",
+    JwtES256 => "ES256",
+  };
+}
+
+function jwtAlgOf(name: string): Option<JwtAlg> {
+  if (name == "HS256") {
+    return Some(JwtHS256);
+  }
+  if (name == "RS256") {
+    return Some(JwtRS256);
+  }
+  if (name == "ES256") {
+    return Some(JwtES256);
+  }
+  return None;
+}
+
+// signingInput = ASCII(BASE64URL(header) "." BASE64URL(payload)); signature = the decoded third part.
+export type SignatureVerifier = (signingInput: Bytes, signature: Bytes) => bool;
+
+export type JwtKey =
+  JwtSecret(Option<string>, Bytes)
+  | JwtExternalKey(Option<string>, JwtAlg, SignatureVerifier);
+
+export const MIN_HMAC_KEY_BYTES: usize = 32;
+
+// jwtSecret(kid, secret): Result<JwtKey, AuthError> -- an HS256 key. RFC 7518 3.2 requires a key at least as long as the hash
+// (32 bytes); a shorter one is refused. Use random bytes, not a passphrase.
+export function jwtSecret(kid: Option<string>, secret: Bytes): Result<JwtKey, AuthError> {
+  if (secret.length() < MIN_HMAC_KEY_BYTES) {
+    return Err(authError(ConfigInvalid, "an HS256 key must be at least 32 bytes"));
+  }
+  return Ok(JwtSecret(kid, secret));
+}
+
+// jwtExternalKey(kid, alg, verifier): Result<JwtKey, AuthError> -- a key checked by `verifier` (RS256 / ES256). `alg` must not be
+// HS256: an HMAC key is a `JwtSecret`, so no verifier function can be tricked into the symmetric case.
+export function jwtExternalKey(
+  kid: Option<string>,
+  alg: JwtAlg,
+  verifier: SignatureVerifier,
+): Result<JwtKey, AuthError> {
+  return match (alg) {
+    JwtHS256 => Err(authError(ConfigInvalid, "use jwtSecret for HS256")),
+    _ => Ok(JwtExternalKey(kid, alg, verifier)),
+  };
+}
+
+function keyKid(k: JwtKey): Option<string> {
+  return match (k) {
+    JwtSecret(kid, s) => kid,
+    JwtExternalKey(kid, a, v) => kid,
+  };
+}
+
+function keyAlg(k: JwtKey): JwtAlg {
+  return match (k) {
+    JwtSecret(kid, s) => JwtHS256,
+    JwtExternalKey(kid, a, v) => a,
+  };
+}
+
+// ------------------------------------------------------------------------------------------------------------------ errors
+
+export type JwtErrorKind =
+  JwtMalformed // not three base64url parts, bad JSON, wrong claim types
+  | JwtTooLarge
+  | JwtAlgNone // alg "none" (the unsecured JWT): never accepted
+  | JwtAlgUnsupported // an alg this library does not know
+  | JwtAlgNotAllowed // known, but not in the allow-list, or not the algorithm of the selected key
+  | JwtCritUnsupported // a `crit` header
+  | JwtKeyUnknown // no key for this kid
+  | JwtBadSignature
+  | JwtExpired
+  | JwtNotYetValid
+  | JwtWrongIssuer
+  | JwtWrongAudience
+  | JwtMissingClaim;
+
+export type JwtError = { kind: JwtErrorKind; detail: string; };
+
+function jerr(kind: JwtErrorKind, detail: string): JwtError {
+  return JwtError { kind: kind, detail: detail };
+}
+
+// jwtErrorMessage(e): string -- safe to log; contains no token text.
+export function jwtErrorMessage(e: JwtError): string {
+  return e.detail;
+}
+
+// ------------------------------------------------------------------------------------------------------------------ options
+
+// algorithms: the allow-list (default only HS256). issuer / audience: required values when Some (SET AUDIENCE: without it a token
+// minted for another service of yours is accepted). leewaySeconds: tolerated clock skew for exp / nbf (default 60).
+// requireExp: refuse tokens without `exp` (default true). maxTokenBytes: default 8192.
+export type JwtOptions = {
+  algorithms: JwtAlg[];
+  issuer: Option<string>;
+  audience: Option<string>;
+  leewaySeconds: int;
+  requireExp: bool;
+  maxTokenBytes: usize;
+};
+
+export function defaultJwtOptions(): JwtOptions {
+  return JwtOptions {
+    algorithms: [JwtHS256],
+    issuer: None,
+    audience: None,
+    leewaySeconds: 60,
+    requireExp: true,
+    maxTokenBytes: 8192,
+  };
+}
+
+export type VerifiedJwt = {
+  alg: JwtAlg;
+  kid: Option<string>;
+  header: JsonValue;
+  claims: JsonValue;
+};
+
+// ------------------------------------------------------------------------------------------------------------------ JSON helpers
+
+// member(obj, key): Option<JsonValue> -- a member of a JSON object (None for a non-object or an absent key).
+export function jsonMemberOf(obj: JsonValue, key: string): Option<JsonValue> {
+  return match (obj) {
+    ValueObject(ms) => {
+      for (const m of ms) {
+        if (m.key == key) {
+          return Some(m.value);
+        }
+      }
+      return None;
+    },
+    _ => None,
+  };
+}
+
+// claimString(claims, name): Option<string> -- the claim when it is a string.
+export function claimString(claims: JsonValue, name: string): Option<string> {
+  const v = jsonMemberOf(claims, name);
+  if (v.isNone()) {
+    return None;
+  }
+  return match (v.unwrap()) {
+    ValueString(s) => Some(s),
+    _ => None,
+  };
+}
+
+// claimStrings(claims, name): string[] -- a claim that is a string (one element) or an array of strings (the strings of it; other
+// elements are skipped). Empty when absent.
+export function claimStrings(claims: JsonValue, name: string): string[] {
+  let out: string[] = [];
+  const v = jsonMemberOf(claims, name);
+  if (v.isNone()) {
+    return out;
+  }
+  match (v.unwrap()) {
+    ValueString(s) => {
+      out.push(s);
+    },
+    ValueArray(xs) => {
+      for (const x of xs) {
+        match (x) {
+          ValueString(s) => {
+            out.push(s);
+          },
+          _ => {},
+        }
+      }
+    },
+    _ => {},
+  }
+  return out;
+}
+
+// claimInt(claims, name): Option<int> -- the claim when it is an integer number.
+export function claimInt(claims: JsonValue, name: string): Option<int> {
+  const v = jsonMemberOf(claims, name);
+  if (v.isNone()) {
+    return None;
+  }
+  return match (v.unwrap()) {
+    ValueNumber(n) => {
+      const i = numberAsInt(n);
+      return i.isOk() ? Some(i.unwrap()) : None;
+    },
+    _ => None,
+  };
+}
+
+// ------------------------------------------------------------------------------------------------------------------ signing
+
+// jwtClaims(...) -- the registered claims as a JSON object, followed by `extra` members. `subject`, `issuer` and `audience` are
+// omitted when empty; `iat` is `issuedAtSec`, `exp` is `expiresAtSec` (seconds since the epoch).
+export function jwtClaims(
+  subject: string,
+  issuer: string,
+  audience: string,
+  issuedAtSec: int,
+  expiresAtSec: int,
+  extra: JsonMember[],
+): JsonValue {
+  let ms: JsonMember[] = [];
+  if (issuer.length > 0) {
+    ms.push(JsonMember { key: "iss", value: ValueString(issuer) });
+  }
+  if (subject.length > 0) {
+    ms.push(JsonMember { key: "sub", value: ValueString(subject) });
+  }
+  if (audience.length > 0) {
+    ms.push(JsonMember { key: "aud", value: ValueString(audience) });
+  }
+  ms.push(JsonMember { key: "iat", value: ValueNumber(numberFromInt(issuedAtSec)) });
+  ms.push(JsonMember { key: "exp", value: ValueNumber(numberFromInt(expiresAtSec)) });
+  for (const m of extra) {
+    ms.push(m);
+  }
+  return ValueObject(ms);
+}
+
+function b64(text: string): string {
+  return base64UrlEncode(textToBytes(text));
+}
+
+// signJwt(key, claims): Result<string, AuthError> -- the compact JWT, signed with an HS256 `JwtSecret` key. Header:
+// {"alg":"HS256","typ":"JWT"} plus "kid" when the key has one.
+export function signJwt(key: JwtKey, claims: JsonValue): Result<string, AuthError> {
+  return match (key) {
+    JwtSecret(kid, secret) => {
+      let hm: JsonMember[] = [
+        JsonMember { key: "alg", value: ValueString("HS256") },
+        JsonMember { key: "typ", value: ValueString("JWT") },
+      ];
+      if (kid.isSome()) {
+        hm.push(JsonMember { key: "kid", value: ValueString(kid.unwrap()) });
+      }
+      const h = writeDocument(ValueObject(hm), defaultLimits());
+      const p = writeDocument(claims, defaultLimits());
+      if (h.isErr() || p.isErr()) {
+        return Err(authError(InputInvalid, "the claims cannot be written as JSON"));
+      }
+      const input = b64(h.unwrap()) + "." + b64(p.unwrap());
+      return Ok(input + "." + base64UrlEncode(hmacSha256(secret, textToBytes(input))));
+    },
+    JwtExternalKey(kid, a, v) => Err(
+      authError(FeatureUnsupported, "signing with RS256 / ES256 is not implemented"),
+    ),
+  };
+}
+
+// ------------------------------------------------------------------------------------------------------------------ verifying
+
+function parseJson(bytes: Bytes): Option<JsonValue> {
+  const r = parseDocument(bytesToText(bytes), defaultReadOptions());
+  return r.isOk() ? Some(r.unwrap()) : None;
+}
+
+// The key for a token: by `kid`. A token without kid matches keys without kid, or the only key of a one-key set.
+function selectKey(keys: JwtKey[], kid: Option<string>): Option<JwtKey> {
+  for (const k of keys) {
+    const kk = keyKid(k);
+    if (kid.isSome() && kk.isSome() && kk.unwrap() == kid.unwrap()) {
+      return Some(k);
+    }
+    if (kid.isNone() && kk.isNone()) {
+      return Some(k);
+    }
+  }
+  if (kid.isNone() && keys.length == 1) {
+    return Some(keys[0]);
+  }
+  return None;
+}
+
+function sameAlg(a: JwtAlg, b: JwtAlg): bool {
+  return jwtAlgName(a) == jwtAlgName(b);
+}
+
+function algAllowed(allowed: JwtAlg[], a: JwtAlg): bool {
+  for (const x of allowed) {
+    if (sameAlg(x, a)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// verifyJwt(token, keys, options, nowMs): Result<VerifiedJwt, JwtError> -- see the module comment for the order of checks.
+export function verifyJwt(
+  token: string,
+  keys: JwtKey[],
+  options: JwtOptions,
+  nowMs: int,
+): Result<VerifiedJwt, JwtError> {
+  if (token.length > options.maxTokenBytes) {
+    return Err(jerr(JwtTooLarge, "token is too large"));
+  }
+  const parts = token.split(".");
+  if (parts.length != 3 || parts[0].length == 0 || parts[1].length == 0) {
+    return Err(jerr(JwtMalformed, "a JWT has three dot-separated parts"));
+  }
+  const headerBytes = base64UrlDecode(parts[0]);
+  const payloadBytes = base64UrlDecode(parts[1]);
+  const signature = base64UrlDecode(parts[2]);
+  if (headerBytes.isNone() || payloadBytes.isNone() || signature.isNone()) {
+    return Err(jerr(JwtMalformed, "a part is not unpadded base64url"));
+  }
+  const header = parseJson(headerBytes.unwrap());
+  if (header.isNone()) {
+    return Err(jerr(JwtMalformed, "the header is not a JSON object"));
+  }
+  match (header.unwrap()) {
+    ValueObject(ms) => {},
+    _ => {
+      return Err(jerr(JwtMalformed, "the header is not a JSON object"));
+    },
+  }
+  if (jsonMemberOf(header.unwrap(), "crit").isSome()) {
+    return Err(jerr(JwtCritUnsupported, "critical header extensions are not supported"));
+  }
+  const algName = claimString(header.unwrap(), "alg");
+  if (algName.isNone()) {
+    return Err(jerr(JwtMalformed, "the header has no alg string"));
+  }
+  if (algName.unwrap().length == 4 && toLowerAscii(algName.unwrap()) == "none") {
+    return Err(jerr(JwtAlgNone, "unsecured tokens (alg none) are never accepted"));
+  }
+  const alg = jwtAlgOf(algName.unwrap());
+  if (alg.isNone()) {
+    return Err(jerr(JwtAlgUnsupported, "unsupported algorithm"));
+  }
+  if (!algAllowed(options.algorithms, alg.unwrap())) {
+    return Err(jerr(JwtAlgNotAllowed, "algorithm is not allowed"));
+  }
+  const kidClaim = jsonMemberOf(header.unwrap(), "kid");
+  let kid: Option<string> = None;
+  if (kidClaim.isSome()) {
+    kid = claimString(header.unwrap(), "kid");
+    if (kid.isNone()) {
+      return Err(jerr(JwtMalformed, "kid must be a string"));
+    }
+  }
+  const key = selectKey(keys, kid);
+  if (key.isNone()) {
+    return Err(jerr(JwtKeyUnknown, "no key for this token"));
+  }
+  if (!sameAlg(keyAlg(key.unwrap()), alg.unwrap())) {
+    return Err(jerr(JwtAlgNotAllowed, "the token's algorithm is not the algorithm of its key"));
+  }
+  const signingInput = textToBytes(parts[0] + "." + parts[1]);
+  const sigOk = match (key.unwrap()) {
+    JwtSecret(k, secret) => signature.unwrap().length() == 32
+        && constantTimeEquals(signature.unwrap(), hmacSha256(secret, signingInput)),
+    JwtExternalKey(k, a, verify) => verify(signingInput, signature.unwrap()),
+  };
+  if (!sigOk) {
+    return Err(jerr(JwtBadSignature, "signature does not match"));
+  }
+  // Authenticated from here on.
+  const claims = parseJson(payloadBytes.unwrap());
+  if (claims.isNone()) {
+    return Err(jerr(JwtMalformed, "the payload is not a JSON object"));
+  }
+  match (claims.unwrap()) {
+    ValueObject(ms) => {},
+    _ => {
+      return Err(jerr(JwtMalformed, "the payload is not a JSON object"));
+    },
+  }
+  checkClaims(claims.unwrap(), options, nowMs)?;
+  return Ok(VerifiedJwt {
+    alg: alg.unwrap(),
+    kid: kid,
+    header: header.unwrap(),
+    claims: claims.unwrap(),
+  });
+}
+
+// A NumericDate claim: Ok(None) when absent, Err when present but not an integer.
+function numericDate(claims: JsonValue, name: string): Result<Option<int>, JwtError> {
+  if (jsonMemberOf(claims, name).isNone()) {
+    return Ok(None);
+  }
+  const v = claimInt(claims, name);
+  if (v.isNone()) {
+    return Err(jerr(JwtMalformed, name + " must be an integer NumericDate"));
+  }
+  return Ok(v);
+}
+
+function checkClaims(claims: JsonValue, o: JwtOptions, nowMs: int): Result<void, JwtError> {
+  const now = nowMs / 1000;
+  const exp = numericDate(claims, "exp")?;
+  const nbf = numericDate(claims, "nbf")?;
+  numericDate(claims, "iat")?;
+  if (exp.isNone() && o.requireExp) {
+    return Err(jerr(JwtMissingClaim, "exp is required"));
+  }
+  if (exp.isSome() && now >= exp.unwrap() + o.leewaySeconds) {
+    return Err(jerr(JwtExpired, "token expired"));
+  }
+  if (nbf.isSome() && now + o.leewaySeconds < nbf.unwrap()) {
+    return Err(jerr(JwtNotYetValid, "token not valid yet"));
+  }
+  if (o.issuer.isSome()) {
+    const iss = claimString(claims, "iss");
+    if (iss.isNone() || iss.unwrap() != o.issuer.unwrap()) {
+      return Err(jerr(JwtWrongIssuer, "wrong issuer"));
+    }
+  }
+  if (o.audience.isSome()) {
+    if (!claimStrings(claims, "aud").includes(o.audience.unwrap())) {
+      return Err(jerr(JwtWrongAudience, "wrong audience"));
+    }
+  }
+  return Ok();
+}
+
+// ------------------------------------------------------------------------------------------------------------------ authenticator
+
+// jwtPrincipal(v): Principal -- the default mapping of a verified token: subject = `sub`; scopes = `scope` (a space-separated string,
+// RFC 8693 / 9068) plus `scp` (a string or array); roles = `roles` (string or array).
+export function jwtPrincipal(v: VerifiedJwt): Option<Principal> {
+  const sub = claimString(v.claims, "sub");
+  if (sub.isNone() || sub.unwrap().length == 0) {
+    return None;
+  }
+  let scopes: string[] = [];
+  const scope = claimString(v.claims, "scope");
+  if (scope.isSome()) {
+    for (const s of scope.unwrap().split(" ")) {
+      if (s.length > 0) {
+        scopes.push(s);
+      }
+    }
+  }
+  for (const s of claimStrings(v.claims, "scp")) {
+    scopes.push(s);
+  }
+  return Some(Principal {
+    subject: sub.unwrap(),
+    roles: claimStrings(v.claims, "roles"),
+    scopes: scopes,
+    method: ViaJwt,
+  });
+}
+
+// jwtAuthenticator(keys, options, toPrincipal): Authenticator -- authenticates `Authorization: Bearer <jwt>`. A bearer credential
+// that does not look like a JWT (not exactly two dots) is not ours: anonymous. One that does and fails any check is `AuthFailed`
+// (401 `invalid_token`; the detail names the failed check but never echoes the token). `toPrincipal` maps claims to a principal
+// (`jwtPrincipal` is the usual choice); None = refuse.
+export function jwtAuthenticator(
+  keys: JwtKey[],
+  options: JwtOptions,
+  toPrincipal: (v: VerifiedJwt) => Option<Principal>,
+): Authenticator {
+  return (req: Request, now: int): AuthOutcome => {
+    const bearer = req.bearerToken();
+    if (bearer.isNone() || bearer.unwrap().split(".").length != 3) {
+      return AuthAnonymous;
+    }
+    const v = verifyJwt(bearer.unwrap(), keys, options, now);
+    if (v.isErr()) {
+      return AuthFailed(jwtErrorMessage(v.unwrapErr()), "Bearer error=\"invalid_token\"");
+    }
+    const p = toPrincipal(v.unwrap());
+    if (p.isNone()) {
+      return AuthFailed("token has no usable subject", "Bearer error=\"invalid_token\"");
+    }
+    return AuthPassed(p.unwrap(), noExtras());
+  };
+}

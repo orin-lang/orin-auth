@@ -1,0 +1,365 @@
+// Server-side sessions with opaque ids.
+//
+//   * The id is 256 random bits (base64url, 43 characters) in a cookie. It carries no information: the data lives in the store.
+//   * The store never sees the id. It is keyed by SHA-256(id) (hex), so a leaked store (backup, log, SQL injection, memory dump)
+//     cannot be replayed as cookies.
+//   * Expiry: an IDLE timeout that slides forward on use (written at most once per `touchIntervalSeconds`, to keep the store quiet)
+//     and an ABSOLUTE timeout that never moves. Expired records are removed when met.
+//   * Login ALWAYS mints a new id and destroys the one the client presented (session fixation protection); `rotate` does the same
+//     after a privilege change. The server never accepts an id chosen by the client: an unknown id is simply anonymous.
+//   * Logout removes the record on the server and clears the cookie; `logoutSubject` ends all sessions of a user.
+import { Bytes } from "std:bytes";
+import { Scope } from "std:task";
+import { QueryPair } from "std:url";
+import { Request, Response } from "orin-web";
+import {
+  AuthError, authError, ConfigInvalid, InputInvalid, EntropyFailed, ServiceUnavailable,
+} from "./error";
+import { RandomFn } from "./services";
+import {
+  CookieAttrs, defaultCookieAttrs, checkCookie, setCookieValue, clearCookieValue, requestCookie,
+} from "./cookie";
+import { sha256, hexEncode, base64UrlEncode, textToBytes } from "./internal/crypto";
+import { KvHandle, startKv } from "./internal/kv";
+
+// ------------------------------------------------------------------------------------------------------------ records and stores
+
+// All times are milliseconds since the Unix epoch. `idHash` is the store key.
+export type SessionRecord = {
+  idHash: string;
+  subject: string;
+  roles: string[];
+  scopes: string[];
+  createdAt: int;
+  lastSeen: int;
+  idleExpiresAt: int;
+  absoluteExpiresAt: int;
+  attrs: QueryPair[];
+};
+
+// A session store. Implementations must be safe to call from many tasks at once (the in-memory one is an owner task). Methods
+// answer `false` / `None` / 0 when the backing service is gone; orin-auth then treats the request as anonymous (fail closed).
+export interface SessionStore {
+  load(idHash: string): Option<SessionRecord>;
+  save(rec: SessionRecord): bool;
+  remove(idHash: string): bool;
+  removeSubject(subject: string): int;
+  removeExpired(now: int): int;
+}
+
+// The in-memory store: one owner task, atomic per command, lost on restart, single process. Use a shared database implementation
+// of `SessionStore` for several instances.
+export class MemorySessionStore implements SessionStore {
+  private kv: KvHandle<SessionRecord>;
+
+  constructor(kv: KvHandle<SessionRecord>) {
+    this.kv = kv;
+  }
+
+  // MemorySessionStore.start(s) -- starts the owner task in scope `s`; call `close()` before the scope ends.
+  static start(s: Scope): MemorySessionStore {
+    return new MemorySessionStore(startKv<SessionRecord>(s));
+  }
+
+  load(idHash: string): Option<SessionRecord> {
+    return this.kv.get(idHash);
+  }
+
+  save(rec: SessionRecord): bool {
+    return this.kv.put(rec.idHash, rec);
+  }
+
+  remove(idHash: string): bool {
+    return this.kv.remove(idHash);
+  }
+
+  removeSubject(subject: string): int {
+    return this.kv.sweep((r: SessionRecord): bool => r.subject == subject);
+  }
+
+  removeExpired(now: int): int {
+    return this.kv.sweep(
+      (r: SessionRecord): bool => now >= r.idleExpiresAt || now >= r.absoluteExpiresAt,
+    );
+  }
+
+  // size(): int -- the number of stored sessions (for tests and metrics).
+  size(): int {
+    return this.kv.count();
+  }
+
+  close(): void {
+    this.kv.close();
+  }
+}
+
+// ------------------------------------------------------------------------------------------------------------ configuration
+
+// cookieName: "__Host-sid" by default (browser-enforced Secure, Path=/, host-only). cookie: Path, Domain, Secure, HttpOnly, SameSite
+// (`maxAge` is ignored: see `persistent`). persistent: false = a session cookie that the browser drops on close; true = Max-Age
+// follows the idle timeout. idleTimeoutSeconds: 30 minutes. absoluteTimeoutSeconds: 12 hours. touchIntervalSeconds: how often a
+// used session is written back to slide the idle timeout (60 s). idBytes: size of the random id (>= 16, default 32).
+export type SessionConfig = {
+  cookieName: string;
+  cookie: CookieAttrs;
+  persistent: bool;
+  idleTimeoutSeconds: int;
+  absoluteTimeoutSeconds: int;
+  touchIntervalSeconds: int;
+  idBytes: usize;
+};
+
+export function defaultSessionConfig(): SessionConfig {
+  return SessionConfig {
+    cookieName: "__Host-sid",
+    cookie: defaultCookieAttrs(),
+    persistent: false,
+    idleTimeoutSeconds: 1800,
+    absoluteTimeoutSeconds: 43200,
+    touchIntervalSeconds: 60,
+    idBytes: 32,
+  };
+}
+
+// checkSessionConfig(c): Result<void, AuthError> -- a configuration that can work: a valid cookie (see `checkCookie`), positive
+// timeouts with idle <= absolute, an id of at least 128 bits.
+export function checkSessionConfig(c: SessionConfig): Result<void, AuthError> {
+  checkCookie(c.cookieName, "x", c.cookie)?;
+  if (c.idleTimeoutSeconds < 1
+      || c.absoluteTimeoutSeconds < c.idleTimeoutSeconds
+      || c.touchIntervalSeconds < 0) {
+    return Err(authError(ConfigInvalid, "session timeouts must be positive and idle <= absolute"));
+  }
+  if (c.idBytes < 16 || c.idBytes > 64) {
+    return Err(
+      authError(ConfigInvalid, "session ids must be 16..64 random bytes (128 bits at least)"),
+    );
+  }
+  return Ok();
+}
+
+// ------------------------------------------------------------------------------------------------------------ the manager
+
+// The result of creating a session: the id (only the client ever holds it), the `Set-Cookie` value to send, the stored record.
+export type NewSession = { id: string; setCookie: string; record: SessionRecord; };
+
+// What `lookup` found.
+export type SessionLookup =
+  SessionAnonymous
+  | SessionActive(SessionRecord, Option<string>)
+  | SessionExpired;
+
+export function sessionIdHash(id: string): string {
+  return hexEncode(sha256(textToBytes(id)));
+}
+
+function isBase64UrlChar(c: int): bool {
+  return c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 45 || c == 95;
+}
+
+export class SessionManager {
+  private store: SessionStore;
+  private random: RandomFn;
+  private cfg: SessionConfig;
+
+  constructor(store: SessionStore, random: RandomFn, cfg: SessionConfig) {
+    this.store = store;
+    this.random = random;
+    this.cfg = cfg;
+  }
+
+  // SessionManager.create(store, random, config) -- validates the configuration first.
+  static create(
+    store: SessionStore,
+    random: RandomFn,
+    cfg: SessionConfig,
+  ): Result<SessionManager, AuthError> {
+    checkSessionConfig(cfg)?;
+    return Ok(new SessionManager(store, random, cfg));
+  }
+
+  config(): SessionConfig {
+    return this.cfg;
+  }
+
+  // The length of a well-formed id in characters: base64url of idBytes without padding.
+  private idLength(): usize {
+    return (this.cfg.idBytes * 4 + 2) / 3;
+  }
+
+  // The session id the request presented, if it has the right shape. Shape only: this does not look at the store.
+  presentedId(req: Request): Option<string> {
+    const raw = requestCookie(req, this.cfg.cookieName);
+    if (raw.isNone() || raw.unwrap().length != this.idLength()) {
+      return None;
+    }
+    const id = raw.unwrap();
+    let i: usize = 0;
+    while (i < id.length) {
+      if (!isBase64UrlChar(id.charCodeAt(i).toInt())) {
+        return None;
+      }
+      i += 1;
+    }
+    return Some(id);
+  }
+
+  private cookieAttrsFor(maxAgeSeconds: Option<int>): CookieAttrs {
+    return CookieAttrs { ...this.cfg.cookie, maxAge: maxAgeSeconds };
+  }
+
+  private cookieFor(id: string, remainingMs: int): Result<string, AuthError> {
+    let ttl: Option<int> = None;
+    if (this.cfg.persistent) {
+      ttl = Some(remainingMs / 1000 < 1 ? 1 : remainingMs / 1000);
+    }
+    return setCookieValue(this.cfg.cookieName, id, this.cookieAttrsFor(ttl));
+  }
+
+  private mint(
+    now: int,
+    subject: string,
+    roles: string[],
+    scopes: string[],
+    attrs: QueryPair[],
+    createdAt: int,
+    absoluteExpiresAt: int,
+  ): Result<NewSession, AuthError> {
+    if (subject.length == 0) {
+      return Err(authError(InputInvalid, "a session needs a subject"));
+    }
+    const raw = this.random(this.cfg.idBytes);
+    if (raw.isErr()) {
+      return Err(raw.unwrapErr());
+    }
+    const id = base64UrlEncode(raw.unwrap());
+    const idle = now + this.cfg.idleTimeoutSeconds * 1000;
+    const rec = SessionRecord {
+      idHash: sessionIdHash(id),
+      subject: subject,
+      roles: roles,
+      scopes: scopes,
+      createdAt: createdAt,
+      lastSeen: now,
+      idleExpiresAt: idle < absoluteExpiresAt ? idle : absoluteExpiresAt,
+      absoluteExpiresAt: absoluteExpiresAt,
+      attrs: attrs,
+    };
+    if (!this.store.save(rec)) {
+      return Err(authError(ServiceUnavailable, "the session store is not available"));
+    }
+    const cookie = this.cookieFor(id, rec.idleExpiresAt - now)?;
+    return Ok(NewSession { id: id, setCookie: cookie, record: rec });
+  }
+
+  // login(req, now, subject, roles, scopes): Result<NewSession, AuthError> -- call after the credentials were checked. Creates a
+  // NEW session and removes the one the request carried, so an id planted before login is worthless afterwards. Add
+  // `setCookie` to the response with `withAddedHeader("Set-Cookie", ...)`.
+  login(
+    req: Request,
+    now: int,
+    subject: string,
+    roles: string[],
+    scopes: string[],
+  ): Result<NewSession, AuthError> {
+    const old = this.presentedId(req);
+    const made = this.mint(
+      now,
+      subject,
+      roles,
+      scopes,
+      [],
+      now,
+      now + this.cfg.absoluteTimeoutSeconds * 1000,
+    )?;
+    if (old.isSome()) {
+      this.store.remove(sessionIdHash(old.unwrap()));
+    }
+    return Ok(made);
+  }
+
+  // rotate(req, now): Result<NewSession, AuthError> -- the same session data under a new id (call after a privilege change, e.g.
+  // a password change or step-up authentication). The absolute expiry is kept. Err(InputInvalid) when the request has no valid
+  // session.
+  rotate(req: Request, now: int): Result<NewSession, AuthError> {
+    const found = this.lookup(req, now);
+    return match (found) {
+      SessionActive(rec, renewed) => {
+        const made = this.mint(
+          now,
+          rec.subject,
+          rec.roles,
+          rec.scopes,
+          rec.attrs,
+          rec.createdAt,
+          rec.absoluteExpiresAt,
+        )?;
+        this.store.remove(rec.idHash);
+        return Ok(made);
+      },
+      _ => Err(authError(InputInvalid, "no valid session to rotate")),
+    };
+  }
+
+  // lookup(req, now): SessionLookup -- SessionAnonymous (no cookie, wrong shape, unknown id), SessionExpired (a record that has
+  // run out: it is removed) or SessionActive(record, renewedCookie). `renewedCookie` is Some(Set-Cookie value) when the session
+  // was slid forward AND the cookie is persistent, so the browser's Max-Age moves too.
+  lookup(req: Request, now: int): SessionLookup {
+    const id = this.presentedId(req);
+    if (id.isNone()) {
+      return SessionAnonymous;
+    }
+    const key = sessionIdHash(id.unwrap());
+    const found = this.store.load(key);
+    if (found.isNone()) {
+      return SessionAnonymous;
+    }
+    const rec = found.unwrap();
+    if (now >= rec.idleExpiresAt || now >= rec.absoluteExpiresAt) {
+      this.store.remove(key);
+      return SessionExpired;
+    }
+    if (now - rec.lastSeen < this.cfg.touchIntervalSeconds * 1000) {
+      return SessionActive(rec, None);
+    }
+    const idle = now + this.cfg.idleTimeoutSeconds * 1000;
+    const slid = SessionRecord {
+      ...rec,
+      lastSeen: now,
+      idleExpiresAt: idle < rec.absoluteExpiresAt ? idle : rec.absoluteExpiresAt,
+    };
+    if (!this.store.save(slid)) {
+      return SessionActive(rec, None);
+    }
+    if (!this.cfg.persistent) {
+      return SessionActive(slid, None);
+    }
+    const cookie = this.cookieFor(id.unwrap(), slid.idleExpiresAt - now);
+    return SessionActive(slid, cookie.isOk() ? Some(cookie.unwrap()) : None);
+  }
+
+  // logout(req): Result<string, AuthError> -- removes the session on the server and answers the `Set-Cookie` value that clears the
+  // cookie in the browser. Works (and clears the cookie) also when the session is already gone.
+  logout(req: Request): Result<string, AuthError> {
+    const id = this.presentedId(req);
+    if (id.isSome()) {
+      this.store.remove(sessionIdHash(id.unwrap()));
+    }
+    return clearCookieValue(this.cfg.cookieName, this.cfg.cookie);
+  }
+
+  // logoutSubject(subject): int -- ends every session of a user (password change, account disabled); the number removed.
+  logoutSubject(subject: string): int {
+    return this.store.removeSubject(subject);
+  }
+
+  // purgeExpired(now): int -- removes expired records; run it now and then (a timer in `main`) to bound memory.
+  purgeExpired(now: int): int {
+    return this.store.removeExpired(now);
+  }
+
+  // clearCookie(): the `Set-Cookie` value that clears the session cookie (for an expired or invalid cookie).
+  clearCookie(): Result<string, AuthError> {
+    return clearCookieValue(this.cfg.cookieName, this.cfg.cookie);
+  }
+}

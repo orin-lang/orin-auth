@@ -1,0 +1,235 @@
+import { assert, assertEq, assertEqString, assertEqBool } from "std:test";
+import { Get, Post } from "std:http";
+import { fromString } from "std:bytes";
+import { scope } from "std:task";
+import {
+  TestClient, testRequest, assertStatus, assertHeader, Response, MemorySessionStore,
+  MemoryApiTokenStore, SessionManager, defaultSessionConfig, RateLimiter, RateLimitConfig,
+  CsrfProtection, defaultCsrfConfig, PasswordPolicy, Pbkdf2Sha256, hashPassword, fixedClock,
+  countingRandom, issueApiToken, TokenSpec, Router, Request,
+} from "orin-auth";
+import { AppDeps, User, buildApp } from "../src/app";
+
+const T0: int = 1700000000000;
+
+function between(s: string, open: string, close: string): string {
+  const a = s.indexOf(open);
+  if (a.isNone()) {
+    return "";
+  }
+  const rest = s.substring(a.unwrap() + open.length, s.length);
+  const b = rest.indexOf(close);
+  return b.isSome() ? rest.substring(0, b.unwrap()) : "";
+}
+
+function cookieNamed(r: Response, name: string): string {
+  for (const h of r.headers().getAll("set-cookie")) {
+    if (h.startsWith(name + "=")) {
+      return h.split(";")[0];
+    }
+  }
+  return "";
+}
+
+function form(fields: string): Request {
+  return testRequest(Post, "/login")
+      .withHeader("Content-Type", "application/x-www-form-urlencoded")
+      .withBody(fromString(fields));
+}
+
+// A browser: a client plus the cookies it keeps.
+function withCookies(c: TestClient, cookies: string[]): TestClient {
+  return c.withHeader("Cookie", cookies.join("; "));
+}
+
+@Test
+function theWholeLoginFlow(): void {
+  scope(s => {
+    const rnd = countingRandom(s);
+    const policy = PasswordPolicy { algorithm: Pbkdf2Sha256(2), saltBytes: 16, hashBytes: 32 };
+    const sessionStore = MemorySessionStore.start(s);
+    const tokens = MemoryApiTokenStore.start(s);
+    const limiter = RateLimiter
+        .start(s, RateLimitConfig { capacity: 5, refillEveryMs: 12000, maxKeys: 100 })
+        .unwrap();
+    const mgr = SessionManager.create(sessionStore, rnd.bytes, defaultSessionConfig()).unwrap();
+    const csrf = CsrfProtection
+        .create(defaultCsrfConfig(), fromString("test-csrf-key-test-csrf-key-1234"), rnd.bytes)
+        .unwrap();
+    const deps = AppDeps {
+      sessions: mgr,
+      tokens: tokens,
+      limiter: limiter,
+      csrf: csrf,
+      now: fixedClock(T0),
+      random: rnd.bytes,
+      policy: policy,
+      secureCookies: true,
+      users: [
+        User {
+          name: "ann",
+          phc: hashPassword("ann-password", policy, rnd.bytes).unwrap(),
+          roles: ["admin"],
+          scopes: ["deploy"],
+        },
+        User {
+          name: "bob",
+          phc: hashPassword("bob-password", policy, rnd.bytes).unwrap(),
+          roles: [],
+          scopes: [],
+        },
+      ],
+    };
+    const anon = new TestClient(buildApp(deps));
+
+    // not signed in
+    assertStatus(anon.get("/"), 200);
+    const api = anon.get("/me");
+    assertStatus(api, 401);
+    assertHeader(api, "WWW-Authenticate", "Bearer");
+    const browser = anon.withHeader("Accept", "text/html").get("/me");
+    assertStatus(browser, 303);
+    assertHeader(browser, "Location", "/login?next=%2Fme");
+
+    // the login page carries a CSRF token and sets the binding cookie
+    const page = anon.get("/login");
+    assertStatus(page, 200);
+    const csrfCookie = cookieNamed(page, "__Host-csrf");
+    const token = between(page.bodyText(), "name=csrf_token value=\"", "\"");
+    assert(csrfCookie.length > 0 && token.length == 64, "binding cookie and token");
+    const guest = withCookies(anon, [csrfCookie]);
+
+    // CSRF: no token, or a token without the cookie
+    assertStatus(guest.send(form("user=ann&password=ann-password")), 403);
+    assertStatus(anon.send(form("user=ann&password=ann-password&csrf_token=" + token)), 403);
+
+    // wrong password and unknown user look alike
+    const wrong = guest.send(form("user=ann&password=nope&csrf_token=" + token));
+    const unknown = guest.send(form("user=zed&password=nope&csrf_token=" + token));
+    assertStatus(wrong, 401);
+    assertStatus(unknown, 401);
+    assertEqString(wrong.bodyText(), unknown.bodyText(), "same answer");
+
+    // a successful login: new session cookie, redirect to the safe `next`
+    const ok = guest.send(form("user=ann&password=ann-password&next=%2Fadmin&csrf_token=" + token));
+    assertStatus(ok, 303);
+    assertHeader(ok, "Location", "/admin");
+    const sid = cookieNamed(ok, "__Host-sid");
+    assert(sid.length > 0, "session cookie");
+    // an open redirect in `next` is ignored
+    const evil = guest.send(
+      form("user=ann&password=ann-password&next=%2F%2Fevil.example&csrf_token=" + token),
+    );
+    assertHeader(evil, "Location", "/me");
+
+    // signed in as ann: the session replaces the binding, so fetch a fresh token for POSTs
+    const ann = withCookies(anon, [sid]);
+    const me = ann.get("/me");
+    assertStatus(me, 200);
+    assert(me.bodyText().includes("\"subject\":\"ann\""), "the principal");
+    assertStatus(ann.get("/admin"), 200);
+    const annToken = between(ann.get("/login").bodyText(), "name=csrf_token value=\"", "\"");
+    assertStatus(ann.send(testRequest(Post, "/api/deploy")), 403);
+    const deploy = ann.send(testRequest(Post, "/api/deploy").withHeader("X-CSRF-Token", annToken));
+    assertStatus(deploy, 202);
+
+    // bob has no role and no scope
+    const bobLogin = guest.send(form("user=bob&password=bob-password&csrf_token=" + token));
+    const bob = withCookies(anon, [cookieNamed(bobLogin, "__Host-sid")]);
+    assertStatus(bob.get("/me"), 200);
+    assertStatus(bob.get("/admin"), 403);
+    const bobToken = between(bob.get("/login").bodyText(), "name=csrf_token value=\"", "\"");
+    assertStatus(
+      bob.send(testRequest(Post, "/api/deploy").withHeader("X-CSRF-Token", bobToken)),
+      403,
+    );
+
+    // an API token needs no CSRF token (no cookie rides on it)
+    const issued = issueApiToken(
+      tokens,
+      rnd.bytes,
+      "demo",
+      TokenSpec {
+        subject: "ci",
+        name: "ci",
+        roles: [],
+        scopes: ["deploy"],
+        expiresAt: Some(T0 + 3600000),
+      },
+      T0,
+    ).unwrap();
+    const ci = anon.withHeader("Authorization", "Bearer " + issued.token);
+    assertStatus(ci.send(testRequest(Post, "/api/deploy")), 202);
+    assertStatus(
+      anon
+          .withHeader(
+            "Authorization",
+            "Bearer demo_000000000000000000000000_" + issued.token.substring(30, 73),
+          )
+          .send(testRequest(Post, "/api/deploy")),
+      401,
+    );
+
+    // logout ends the session on the server
+    const out = ann.send(testRequest(Post, "/logout").withHeader("X-CSRF-Token", annToken));
+    assertStatus(out, 303);
+    assert(cookieNamed(out, "__Host-sid") == "__Host-sid=", "cookie cleared");
+    assertStatus(ann.get("/me"), 401);
+
+    rnd.stop();
+    limiter.close();
+    tokens.close();
+    sessionStore.close();
+  });
+}
+
+@Test
+function loginIsRateLimitedPerUser(): void {
+  scope(s => {
+    const rnd = countingRandom(s);
+    const policy = PasswordPolicy { algorithm: Pbkdf2Sha256(2), saltBytes: 16, hashBytes: 32 };
+    const sessionStore = MemorySessionStore.start(s);
+    const tokens = MemoryApiTokenStore.start(s);
+    const limiter = RateLimiter
+        .start(s, RateLimitConfig { capacity: 3, refillEveryMs: 60000, maxKeys: 100 })
+        .unwrap();
+    const mgr = SessionManager.create(sessionStore, rnd.bytes, defaultSessionConfig()).unwrap();
+    const csrf = CsrfProtection
+        .create(defaultCsrfConfig(), fromString("test-csrf-key-test-csrf-key-1234"), rnd.bytes)
+        .unwrap();
+    const deps = AppDeps {
+      sessions: mgr,
+      tokens: tokens,
+      limiter: limiter,
+      csrf: csrf,
+      now: fixedClock(T0),
+      random: rnd.bytes,
+      policy: policy,
+      secureCookies: true,
+      users: [
+        User {
+          name: "ann",
+          phc: hashPassword("ann-password", policy, rnd.bytes).unwrap(),
+          roles: [],
+          scopes: [],
+        },
+      ],
+    };
+    const anon = new TestClient(buildApp(deps));
+    const page = anon.get("/login");
+    const guest = withCookies(anon, [cookieNamed(page, "__Host-csrf")]);
+    const token = between(page.bodyText(), "name=csrf_token value=\"", "\"");
+    assertStatus(guest.send(form("user=ann&password=1&csrf_token=" + token)), 401);
+    assertStatus(guest.send(form("user=ann&password=2&csrf_token=" + token)), 401);
+    assertStatus(guest.send(form("user=ann&password=3&csrf_token=" + token)), 401);
+    const blocked = guest.send(form("user=ann&password=ann-password&csrf_token=" + token));
+    assertStatus(blocked, 429);
+    assertHeader(blocked, "Retry-After", "60");
+    // another user name has its own bucket
+    assertStatus(guest.send(form("user=bob&password=1&csrf_token=" + token)), 401);
+    rnd.stop();
+    limiter.close();
+    tokens.close();
+    sessionStore.close();
+  });
+}

@@ -1,0 +1,134 @@
+// Login rate limiting: an in-memory token bucket per key.
+//
+// Each key (a user name, an IP address, or both joined) has a bucket of up to `capacity` tokens that refills at one token per
+// `refillEveryMs`. An attempt takes a token; with none left it is refused with the time to wait. So `capacity: 5` with
+// `refillEveryMs: 60000` allows a burst of five attempts and then one a minute. A successful login `reset`s the key.
+//
+// The buckets live in one owner task (atomic read-modify-write, no locks). Memory is bounded by `maxKeys`: when the table is full,
+// buckets that are back to full (idle) are dropped first; if it is still full, a NEW key is refused -- failing closed, so that an
+// attacker who invents keys cannot both fill memory and escape the limit. State is per process: behind several instances either
+// pin a client to one instance or use a shared limiter.
+import { Scope } from "std:task";
+import {
+  Request, Response, WebError, Handler, Middleware, statusError, withErrorHeader,
+} from "orin-web";
+import { AuthError, authError, ConfigInvalid } from "./error";
+import { NowFn } from "./services";
+import { KvHandle, startKv } from "./internal/kv";
+
+export type RateLimitConfig = { capacity: int; refillEveryMs: int; maxKeys: int; };
+
+// defaultLoginLimit(): RateLimitConfig -- 5 attempts, then one per 12 seconds (5 a minute), up to 100,000 keys.
+export function defaultLoginLimit(): RateLimitConfig {
+  return RateLimitConfig { capacity: 5, refillEveryMs: 12000, maxKeys: 100000 };
+}
+
+export type Bucket = { milli: int; at: int; allowed: bool; retryAfterMs: int; };
+
+// allowed: this attempt may proceed. retryAfterMs: how long until the next token (0 when allowed). remaining: whole tokens left.
+export type RateDecision = { allowed: bool; retryAfterMs: int; remaining: int; };
+
+function refilled(cfg: RateLimitConfig, b: Bucket, now: int): int {
+  const elapsed = now > b.at ? now - b.at : 0;
+  const gained = elapsed >= cfg.capacity * cfg.refillEveryMs
+      ? cfg.capacity * 1000
+      : elapsed * 1000 / cfg.refillEveryMs;
+  const total = b.milli + gained;
+  return total > cfg.capacity * 1000 ? cfg.capacity * 1000 : total;
+}
+
+export class RateLimiter {
+  private kv: KvHandle<Bucket>;
+  private cfg: RateLimitConfig;
+
+  constructor(kv: KvHandle<Bucket>, cfg: RateLimitConfig) {
+    this.kv = kv;
+    this.cfg = cfg;
+  }
+
+  // RateLimiter.start(s, config) -- starts the owner task in scope `s`; call `close()` before the scope ends.
+  static start(s: Scope, cfg: RateLimitConfig): Result<RateLimiter, AuthError> {
+    if (cfg.capacity < 1 || cfg.refillEveryMs < 1 || cfg.maxKeys < 1) {
+      return Err(authError(ConfigInvalid, "capacity, refillEveryMs and maxKeys must be positive"));
+    }
+    return Ok(new RateLimiter(startKv<Bucket>(s), cfg));
+  }
+
+  // allow(key, now): RateDecision -- takes one token if there is one.
+  allow(key: string, now: int): RateDecision {
+    const cfg = this.cfg;
+    if (this.kv.count() >= cfg.maxKeys && this.kv.get(key).isNone()) {
+      this.sweep(now);
+      if (this.kv.count() >= cfg.maxKeys) {
+        return RateDecision { allowed: false, retryAfterMs: cfg.refillEveryMs, remaining: 0 };
+      }
+    }
+    const next = this.kv.update(
+      key,
+      (cur: Option<Bucket>): Option<Bucket> => {
+        const have = cur.isSome() ? refilled(cfg, cur.unwrap(), now) : cfg.capacity * 1000;
+        if (have >= 1000) {
+          return Some(Bucket { milli: have - 1000, at: now, allowed: true, retryAfterMs: 0 });
+        }
+        const wait = ((1000 - have) * cfg.refillEveryMs + 999) / 1000;
+        return Some(Bucket { milli: have, at: now, allowed: false, retryAfterMs: wait });
+      },
+    );
+    if (next.isNone()) {
+      return RateDecision { allowed: false, retryAfterMs: cfg.refillEveryMs, remaining: 0 };
+    }
+    const b = next.unwrap();
+    return RateDecision {
+      allowed: b.allowed,
+      retryAfterMs: b.retryAfterMs,
+      remaining: b.milli / 1000,
+    };
+  }
+
+  // reset(key): forgets the key (call after a successful login).
+  reset(key: string): void {
+    this.kv.remove(key);
+  }
+
+  // sweep(now): int -- drops buckets that have refilled completely; the number dropped.
+  sweep(now: int): int {
+    const cfg = this.cfg;
+    return this.kv.sweep((b: Bucket): bool => refilled(cfg, b, now) >= cfg.capacity * 1000);
+  }
+
+  size(): int {
+    return this.kv.count();
+  }
+
+  close(): void {
+    this.kv.close();
+  }
+}
+
+// rateLimit(limiter, keyOf, now): Middleware -- 429 Too Many Requests with `Retry-After` (whole seconds, rounded up) when the key of
+// the request has no token left. `keyOf` returns None for requests that are not limited. The key is yours to choose (a
+// user name from the body, a forwarded address header set by your proxy); the middleware does not guess an IP address.
+export function rateLimit(
+  limiter: RateLimiter,
+  keyOf: (req: Request) => Option<string>,
+  now: NowFn,
+): Middleware {
+  return (req: Request, next: Handler): Result<Response, WebError> => {
+    const key = keyOf(req);
+    if (key.isNone()) {
+      return next(req);
+    }
+    const d = limiter.allow(key.unwrap(), now());
+    if (d.allowed) {
+      return next(req);
+    }
+    const secs = (d.retryAfterMs + 999) / 1000;
+    return Err(
+      withErrorHeader(
+        statusError(429, "too many attempts"),
+        "Retry-After",
+        (secs < 1 ? 1 : secs).toString(),
+      ),
+    );
+  };
+}

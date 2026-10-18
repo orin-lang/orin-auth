@@ -1,0 +1,7 @@
+[package]
+name = "web-login"
+version = "0.1.0"
+entry = "src/main.or"
+
+[dependencies]
+orin-auth = { path = "../.." }

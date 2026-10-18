@@ -1,0 +1,196 @@
+// Cookies (RFC 6265bis): reading the `Cookie` request field and building `Set-Cookie` values with the attributes that matter
+// for session security: HttpOnly, Secure, SameSite, Path, Domain, Max-Age and the `__Host-` / `__Secure-` name prefixes.
+import { isToken } from "std:http";
+import { QueryPair } from "std:url";
+import { Request } from "orin-web";
+import { AuthError, authError, ConfigInvalid, InputInvalid } from "./error";
+
+export type SameSite = SameSiteLax | SameSiteStrict | SameSiteNone;
+
+// path: "/" by default. domain: None = host-only cookie (the safest; required by `__Host-`). maxAge: None = a session cookie
+// (dropped when the browser closes). secure / httpOnly: on by default. SameSite=None requires Secure (checked).
+export type CookieAttrs = {
+  path: string;
+  domain: Option<string>;
+  maxAge: Option<int>;
+  secure: bool;
+  httpOnly: bool;
+  sameSite: SameSite;
+};
+
+// defaultCookieAttrs(): CookieAttrs -- `Path=/; Secure; HttpOnly; SameSite=Lax`, host-only, a session cookie.
+export function defaultCookieAttrs(): CookieAttrs {
+  return CookieAttrs {
+    path: "/",
+    domain: None,
+    maxAge: None,
+    secure: true,
+    httpOnly: true,
+    sameSite: SameSiteLax,
+  };
+}
+
+export function sameSiteName(s: SameSite): string {
+  return match (s) {
+    SameSiteLax => "Lax",
+    SameSiteStrict => "Strict",
+    SameSiteNone => "None",
+  };
+}
+
+// A cookie-octet (RFC 6265 4.1.1): printable ASCII except space, DQUOTE, comma, semicolon and backslash.
+function isCookieOctet(c: int): bool {
+  return c == 33
+      || c >= 35 && c <= 43
+      || c >= 45 && c <= 58
+      || c >= 60 && c <= 91
+      || c >= 93 && c <= 126;
+}
+
+export function isCookieValue(v: string): bool {
+  let i: usize = 0;
+  while (i < v.length) {
+    if (!isCookieOctet(v.charCodeAt(i).toInt())) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function isPathValue(v: string): bool {
+  let i: usize = 0;
+  while (i < v.length) {
+    const c = v.charCodeAt(i).toInt();
+    if (c < 32 || c == 127 || c == 59) {
+      return false;
+    }
+    i += 1;
+  }
+  return v.startsWith("/");
+}
+
+function isDomainValue(v: string): bool {
+  if (v.length == 0) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < v.length) {
+    const c = v.charCodeAt(i).toInt();
+    const ok = c >= 48 && c <= 57
+        || c >= 97 && c <= 122
+        || c >= 65 && c <= 90
+        || c == 45
+        || c == 46;
+    if (!ok) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// checkCookie(name, value, attrs): Result<void, AuthError> -- the rules a cookie must satisfy to be safe and well-formed:
+//   * the name is an HTTP token and the value has only cookie-octets (no `;`, no space, no control characters),
+//   * `SameSite=None` needs `Secure`,
+//   * `__Host-` needs Secure, Path=/ and no Domain; `__Secure-` needs Secure.
+export function checkCookie(
+  name: string,
+  value: string,
+  attrs: CookieAttrs,
+): Result<void, AuthError> {
+  if (!isToken(name)) {
+    return Err(authError(ConfigInvalid, "cookie name is not a valid token"));
+  }
+  if (!isCookieValue(value)) {
+    return Err(authError(InputInvalid, "cookie value has characters that are not allowed"));
+  }
+  if (!isPathValue(attrs.path)) {
+    return Err(
+      authError(ConfigInvalid, "cookie path must start with / and have no control characters or ;"),
+    );
+  }
+  if (attrs.domain.isSome() && !isDomainValue(attrs.domain.unwrap())) {
+    return Err(authError(ConfigInvalid, "cookie domain has characters that are not allowed"));
+  }
+  const none = match (attrs.sameSite) {
+    SameSiteNone => true,
+    _ => false,
+  };
+  if (none && !attrs.secure) {
+    return Err(authError(ConfigInvalid, "SameSite=None requires Secure"));
+  }
+  if (name.startsWith("__Host-")) {
+    if (!attrs.secure || attrs.path != "/" || attrs.domain.isSome()) {
+      return Err(authError(ConfigInvalid, "a __Host- cookie needs Secure, Path=/ and no Domain"));
+    }
+  }
+  if (name.startsWith("__Secure-") && !attrs.secure) {
+    return Err(authError(ConfigInvalid, "a __Secure- cookie needs Secure"));
+  }
+  return Ok();
+}
+
+// setCookieValue(name, value, attrs): Result<string, AuthError> -- the value of a `Set-Cookie` header field.
+export function setCookieValue(
+  name: string,
+  value: string,
+  attrs: CookieAttrs,
+): Result<string, AuthError> {
+  checkCookie(name, value, attrs)?;
+  let out = name + "=" + value + "; Path=" + attrs.path;
+  if (attrs.domain.isSome()) {
+    out = out + "; Domain=" + attrs.domain.unwrap();
+  }
+  if (attrs.maxAge.isSome()) {
+    const m = attrs.maxAge.unwrap();
+    out = out + "; Max-Age=" + (m < 0 ? 0 : m).toString();
+  }
+  if (attrs.secure) {
+    out = out + "; Secure";
+  }
+  if (attrs.httpOnly) {
+    out = out + "; HttpOnly";
+  }
+  out = out + "; SameSite=" + sameSiteName(attrs.sameSite);
+  return Ok(out);
+}
+
+// clearCookieValue(name, attrs): Result<string, AuthError> -- a `Set-Cookie` value that makes the browser drop the cookie
+// (empty value, Max-Age=0), with the same Path / Domain / Secure it was set with.
+export function clearCookieValue(name: string, attrs: CookieAttrs): Result<string, AuthError> {
+  return setCookieValue(name, "", CookieAttrs { ...attrs, maxAge: Some(0) });
+}
+
+// parseCookieHeader(header): the (key = name, value) pairs of a `Cookie` field value, in order. A pair without `=` and a pair with an
+// empty name are skipped. A value in double quotes loses the quotes.
+export function parseCookieHeader(header: string): QueryPair[] {
+  let out: QueryPair[] = [];
+  for (const raw of header.split(";")) {
+    const part = raw.trim();
+    const eq = part.indexOf("=");
+    if (eq.isSome() && eq.unwrap() > 0) {
+      const name = part.substring(0, eq.unwrap()).trim();
+      let value = part.substring(eq.unwrap() + 1, part.length).trim();
+      if (value.length >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
+        value = value.substring(1, value.length - 1);
+      }
+      out.push(QueryPair { key: name, value: value });
+    }
+  }
+  return out;
+}
+
+// requestCookie(req, name): Option<string> -- the value of the cookie `name` in the request. When the browser sent several
+// cookies of that name (different paths or domains) the FIRST is used, which is the one with the most specific path; the
+// others are ignored, never merged.
+export function requestCookie(req: Request, name: string): Option<string> {
+  for (const h of req.headers().getAll("cookie")) {
+    for (const c of parseCookieHeader(h)) {
+      if (c.key == name) {
+        return Some(c.value);
+      }
+    }
+  }
+  return None;
+}

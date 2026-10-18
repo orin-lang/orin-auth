@@ -1,0 +1,114 @@
+// Authentication middleware: turns credentials on a request (a session cookie, a bearer API token, a JWT) into a `Principal`
+// attached to the request, or refuses a request that presented a bad credential.
+//
+// An `Authenticator` looks at one kind of credential:
+//   AuthAnonymous            "this request carries no credential of mine" -> try the next authenticator
+//   AuthPassed(p, extras)    a valid credential -> the request gets principal `p` and the `extras`
+//   AuthFailed(detail, ch)   a credential of my kind that is NOT valid (bad token, wrong signature) -> 401 at once, with the
+//                            `WWW-Authenticate` challenge `ch`. A request that presents a bad credential is never treated as
+//                            anonymous: clients need the error, and an attacker gets no free retry as a different kind.
+//
+// `authenticate` clears any principal first (a principal can only come from an authenticator), tries the authenticators in order
+// and passes the request on. It does NOT require authentication: anonymous requests go through, and `requireAuthenticated` /
+// `requireRole` / `requireScope` (authz.or) decide. The wall clock is read once per request and given to every authenticator.
+import { QueryPair } from "std:url";
+import {
+  Request, Response, WebError, Handler, Middleware, unauthorized, withErrorHeader,
+} from "orin-web";
+import { NowFn } from "./services";
+import { Principal, ViaSession, withPrincipal, withoutPrincipal } from "./principal";
+import { SessionManager, SessionActive, SessionAnonymous, SessionExpired } from "./session";
+
+export type AuthExtras = { attrs: QueryPair[]; setCookies: string[]; };
+
+export type AuthOutcome =
+  AuthAnonymous
+  | AuthPassed(Principal, AuthExtras)
+  | AuthFailed(string, string);
+
+export type Authenticator = (req: Request, now: int) => AuthOutcome;
+
+export function noExtras(): AuthExtras {
+  return AuthExtras { attrs: [], setCookies: [] };
+}
+
+export const SESSION_ATTR: string = "auth.session";
+
+// sessionIdHashOf(req): Option<string> -- the store key of the session that authenticated this request.
+export function sessionIdHashOf(req: Request): Option<string> {
+  const a = req.attr(SESSION_ATTR);
+  return a.isSome() && a.unwrap().length > 0 ? a : None;
+}
+
+// sessionAuthenticator(manager): Authenticator -- authenticates by session cookie. A missing, malformed, unknown or expired
+// session is anonymous (the page then redirects to login); the authenticator attaches the session id hash (`SESSION_ATTR`),
+// which CSRF protection binds its token to.
+export function sessionAuthenticator(manager: SessionManager): Authenticator {
+  return (req: Request, now: int): AuthOutcome => {
+    return match (manager.lookup(req, now)) {
+      SessionAnonymous => AuthAnonymous,
+      SessionExpired => AuthAnonymous,
+      SessionActive(rec, renewed) => {
+        const p = Principal {
+          subject: rec.subject,
+          roles: rec.roles,
+          scopes: rec.scopes,
+          method: ViaSession,
+        };
+        const extras = AuthExtras {
+          attrs: [QueryPair { key: SESSION_ATTR, value: rec.idHash }],
+          setCookies: renewed.isSome() ? [renewed.unwrap()] : [],
+        };
+        return AuthPassed(p, extras);
+      },
+    };
+  };
+}
+
+function withCookies(res: Response, cookies: string[]): Response {
+  let out = res;
+  for (const c of cookies) {
+    out = out.withAddedHeader("Set-Cookie", c);
+  }
+  return out;
+}
+
+function errorWithCookies(e: WebError, cookies: string[]): WebError {
+  let out = e;
+  for (const c of cookies) {
+    out = withErrorHeader(out, "Set-Cookie", c);
+  }
+  return out;
+}
+
+// authenticate(authenticators, now): Middleware -- see the module comment. Put it before CSRF and authorization middleware.
+export function authenticate(authenticators: Authenticator[], now: NowFn): Middleware {
+  return (req: Request, next: Handler): Result<Response, WebError> => {
+    const t = now();
+    const clean = withoutPrincipal(req);
+    for (const a of authenticators) {
+      const outcome = a(clean, t);
+      match (outcome) {
+        AuthAnonymous => {},
+        AuthFailed(detail, challenge) => {
+          return Err(withErrorHeader(unauthorized(detail), "WWW-Authenticate", challenge));
+        },
+        AuthPassed(p, extras) => {
+          let r = withPrincipal(clean, p);
+          for (const kv of extras.attrs) {
+            r = r.withAttr(kv.key, kv.value);
+          }
+          const res = next(r);
+          if (extras.setCookies.length == 0) {
+            return res;
+          }
+          if (res.isOk()) {
+            return Ok(withCookies(res.unwrap(), extras.setCookies));
+          }
+          return Err(errorWithCookies(res.unwrapErr(), extras.setCookies));
+        },
+      }
+    }
+    return next(clean);
+  };
+}

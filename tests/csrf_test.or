@@ -1,0 +1,341 @@
+import { assert, assertEq, assertEqString, assertEqBool, fail } from "std:test";
+import { Get, Post, Put, Delete } from "std:http";
+import { Bytes, fromString } from "std:bytes";
+import { scope } from "std:task";
+import {
+  Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertBody,
+  internalError,
+} from "orin-web";
+import {
+  MemorySessionStore, SessionManager, defaultSessionConfig, countingRandom, fixedClock,
+  authenticate, sessionAuthenticator, CsrfConfig, CsrfProtection, CsrfHeaderMode, defaultCsrfConfig,
+  RandomService, RandomFn,
+} from "../src/module";
+import { setCookieValueOf } from "./support";
+
+const KEY: string = "0123456789abcdef0123456789abcdef";
+
+function build(cfg: CsrfConfig, mgr: SessionManager, rnd: RandomFn): Router {
+  const csrf = CsrfProtection.create(cfg, fromString(KEY), rnd).unwrap();
+  let app = new Router();
+  app.use(authenticate([sessionAuthenticator(mgr)], fixedClock(1000)));
+  app.use(csrf.middleware());
+  app.get(
+    "/form",
+    (req: Request): Result<Response, WebError> => {
+      const t = csrf.token(req);
+      if (t.isErr()) {
+        return Err(internalError("no token"));
+      }
+      return Ok(Response.text(200, t.unwrap()));
+    },
+  );
+  app.post("/act", (req: Request): Result<Response, WebError> => Ok(Response.text(200, "done")));
+  app.put("/act", (req: Request): Result<Response, WebError> => Ok(Response.text(200, "done")));
+  app.delete("/act", (req: Request): Result<Response, WebError> => Ok(Response.text(200, "done")));
+  app.post(
+    "/login",
+    (req: Request): Result<Response, WebError> => {
+      const made = mgr.login(req, 1000, "ann", [], []);
+      return Ok(Response.text(200, "in").withAddedHeader("Set-Cookie", made.unwrap().setCookie));
+    },
+  );
+  return app;
+}
+
+function post(path: string): Request {
+  return testRequest(Post, path);
+}
+
+@Test
+function getEstablishesABindingAndIssuesATokenThatPostAccepts(): void {
+  scope(s => {
+    const store = MemorySessionStore.start(s);
+    const rnd = countingRandom(s);
+    const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
+    const c = new TestClient(build(defaultCsrfConfig(), mgr, rnd.bytes));
+    const page = c.get("/form");
+    assertStatus(page, 200);
+    const binding = setCookieValueOf(page, "__Host-csrf");
+    assert(binding.length > 0, "a binding cookie is set on the first safe request");
+    assert(page.headers().getAll("set-cookie")[0].includes("HttpOnly"), "HttpOnly");
+    const token = page.bodyText();
+    assertEq(token.length.toInt(), 64, "nonce + mac, base64url");
+    const browser = c.withHeader("Cookie", "__Host-csrf=" + binding);
+    assertStatus(browser.send(post("/act").withHeader("X-CSRF-Token", token)), 200);
+    // the same token can be sent again (it is not single-use)
+    assertStatus(browser.send(post("/act").withHeader("X-CSRF-Token", token)), 200);
+    // PUT and DELETE are protected like POST
+    assertStatus(browser.send(testRequest(Put, "/act")), 403);
+    assertStatus(browser.send(testRequest(Delete, "/act")), 403);
+    assertStatus(browser.send(testRequest(Put, "/act").withHeader("X-CSRF-Token", token)), 200);
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function missingOrWrongTokensAreRefused(): void {
+  scope(s => {
+    const store = MemorySessionStore.start(s);
+    const rnd = countingRandom(s);
+    const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
+    const c = new TestClient(build(defaultCsrfConfig(), mgr, rnd.bytes));
+    const page = c.get("/form");
+    const binding = setCookieValueOf(page, "__Host-csrf");
+    const token = page.bodyText();
+    const browser = c.withHeader("Cookie", "__Host-csrf=" + binding);
+    const missing = browser.send(post("/act"));
+    assertStatus(missing, 403);
+    assert(missing.bodyText().includes("token missing"), "says why");
+    assertStatus(browser.send(post("/act").withHeader("X-CSRF-Token", "")), 403);
+    assertStatus(browser.send(post("/act").withHeader("X-CSRF-Token", "garbage")), 403);
+    assertStatus(browser.send(post("/act").withHeader("X-CSRF-Token", token + "A")), 403);
+    const last = token.substring(63, 64);
+    const flippedMac = token.substring(0, 63) + (last == "A" ? "B" : "A");
+    assertStatus(browser.send(post("/act").withHeader("X-CSRF-Token", flippedMac)), 403);
+    const first = token.substring(0, 1);
+    const flippedNonce = (first == "A" ? "B" : "A") + token.substring(1, 64);
+    assertStatus(browser.send(post("/act").withHeader("X-CSRF-Token", flippedNonce)), 403);
+    // no binding cookie at all (an attacker's page cannot read ours, and a request without cookies is not ours)
+    assertStatus(c.send(post("/act").withHeader("X-CSRF-Token", token)), 403);
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function aTokenFromAnotherBrowserDoesNotWork(): void {
+  scope(s => {
+    const store = MemorySessionStore.start(s);
+    const rnd = countingRandom(s);
+    const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
+    const c = new TestClient(build(defaultCsrfConfig(), mgr, rnd.bytes));
+    const attacker = c.get("/form");
+    const victim = c.get("/form");
+    const attackerToken = attacker.bodyText();
+    const victimBinding = setCookieValueOf(victim, "__Host-csrf");
+    assert(setCookieValueOf(attacker, "__Host-csrf") != victimBinding, "bindings differ");
+    // the attacker's own valid token, replayed with the victim's cookie
+    assertStatus(
+      c
+          .withHeader("Cookie", "__Host-csrf=" + victimBinding)
+          .send(post("/act").withHeader("X-CSRF-Token", attackerToken)),
+      403,
+    );
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function tokensAreBoundToTheSession(): void {
+  scope(s => {
+    const store = MemorySessionStore.start(s);
+    const rnd = countingRandom(s);
+    const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
+    const c = new TestClient(build(defaultCsrfConfig(), mgr, rnd.bytes));
+    const loginA = c.send(post("/login").withHeader("X-CSRF-Token", "x"));
+    assertStatus(loginA, 403);
+    // log in as two users through the manager directly
+    const a = mgr.login(testRequest(Get, "/"), 1000, "ann", [], []).unwrap();
+    const b = mgr.login(testRequest(Get, "/"), 1000, "bob", [], []).unwrap();
+    const ann = c.withHeader("Cookie", "__Host-sid=" + a.id);
+    const bob = c.withHeader("Cookie", "__Host-sid=" + b.id);
+    const annToken = ann.get("/form").bodyText();
+    const bobToken = bob.get("/form").bodyText();
+    assertStatus(ann.send(post("/act").withHeader("X-CSRF-Token", annToken)), 200);
+    assertStatus(bob.send(post("/act").withHeader("X-CSRF-Token", bobToken)), 200);
+    assertStatus(ann.send(post("/act").withHeader("X-CSRF-Token", bobToken)), 403);
+    assertStatus(bob.send(post("/act").withHeader("X-CSRF-Token", annToken)), 403);
+    assertStatus(ann.send(post("/act")), 403);
+    // a session needs no extra Set-Cookie for the binding
+    assertEq(
+      ann.get("/form").headers().getAll("set-cookie").length.toInt(),
+      0,
+      "no csrf cookie for a session",
+    );
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function formFieldsCarryTheTokenToo(): void {
+  scope(s => {
+    const store = MemorySessionStore.start(s);
+    const rnd = countingRandom(s);
+    const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
+    const c = new TestClient(build(defaultCsrfConfig(), mgr, rnd.bytes));
+    const page = c.get("/form");
+    const binding = setCookieValueOf(page, "__Host-csrf");
+    const token = page.bodyText();
+    const browser = c.withHeader("Cookie", "__Host-csrf=" + binding);
+    const form = post("/act")
+        .withHeader("Content-Type", "application/x-www-form-urlencoded")
+        .withBody(fromString("a=1&csrf_token=" + token + "&b=2"));
+    assertStatus(browser.send(form), 200);
+    const bad = post("/act")
+        .withHeader("Content-Type", "application/x-www-form-urlencoded")
+        .withBody(fromString("a=1&csrf_token=nope"));
+    assertStatus(browser.send(bad), 403);
+    const json = post("/act")
+        .withHeader("Content-Type", "application/json")
+        .withBody(fromString("{\"csrf_token\":\"" + token + "\"}"));
+    assertStatus(browser.send(json), 403);
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function customHeaderModeRequiresTheHeader(): void {
+  scope(s => {
+    const store = MemorySessionStore.start(s);
+    const rnd = countingRandom(s);
+    const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
+    const c = new TestClient(
+      build(
+        CsrfConfig { ...defaultCsrfConfig(), mode: CsrfHeaderMode("X-Requested-With") },
+        mgr,
+        rnd.bytes,
+      ),
+    );
+    assertStatus(c.send(post("/act")), 403);
+    assertStatus(c.send(post("/act").withHeader("X-Requested-With", "")), 403);
+    assertStatus(c.send(post("/act").withHeader("X-Requested-With", "fetch")), 200);
+    assertStatus(c.get("/form"), 200);
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function originAndFetchMetadataAreChecked(): void {
+  scope(s => {
+    const store = MemorySessionStore.start(s);
+    const rnd = countingRandom(s);
+    const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
+    const c = new TestClient(
+      build(
+        CsrfConfig { ...defaultCsrfConfig(), mode: CsrfHeaderMode("X-Requested-With") },
+        mgr,
+        rnd.bytes,
+      ),
+    )
+        .withHeader("X-Requested-With", "fetch")
+        .withHeader("Host", "app.example");
+    assertStatus(c.send(post("/act").withHeader("Origin", "https://app.example")), 200);
+    assertStatus(c.send(post("/act").withHeader("Origin", "https://evil.example")), 403);
+    assertStatus(c.send(post("/act").withHeader("Origin", "null")), 403);
+    assertStatus(c.send(post("/act").withHeader("Sec-Fetch-Site", "cross-site")), 403);
+    assertStatus(c.send(post("/act").withHeader("Sec-Fetch-Site", "same-origin")), 200);
+    assertStatus(c.send(post("/act").withHeader("Referer", "https://app.example/page?x=1")), 200);
+    assertStatus(c.send(post("/act").withHeader("Referer", "https://evil.example/page")), 403);
+    assertStatus(c.send(post("/act").withHeader("Referer", "not a url")), 403);
+    assertStatus(c.send(post("/act")), 200);
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function strictOriginAndAllowList(): void {
+  scope(s => {
+    const store = MemorySessionStore.start(s);
+    const rnd = countingRandom(s);
+    const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
+    const cfg = CsrfConfig {
+      ...defaultCsrfConfig(),
+      mode: CsrfHeaderMode("X-Requested-With"),
+      allowedOrigins: ["https://app.example", "https://admin.example"],
+      requireOrigin: true,
+    };
+    const c = new TestClient(build(cfg, mgr, rnd.bytes)).withHeader("X-Requested-With", "fetch");
+    assertStatus(c.send(post("/act")), 403);
+    assertStatus(c.send(post("/act").withHeader("Origin", "https://admin.example")), 200);
+    assertStatus(c.send(post("/act").withHeader("Origin", "https://app.example")), 200);
+    assertStatus(c.send(post("/act").withHeader("Origin", "https://app.example.evil.net")), 403);
+    assertStatus(c.send(post("/act").withHeader("Origin", "http://app.example")), 403);
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function authorizationHeaderRequestsAndSkippedRequestsAreExempt(): void {
+  scope(s => {
+    const store = MemorySessionStore.start(s);
+    const rnd = countingRandom(s);
+    const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
+    const c = new TestClient(build(defaultCsrfConfig(), mgr, rnd.bytes));
+    assertStatus(c.send(post("/act")), 403);
+    assertStatus(c.send(post("/act").withHeader("Authorization", "Bearer abc")), 200);
+    const strict = CsrfConfig { ...defaultCsrfConfig(), exemptAuthorization: false };
+    assertStatus(
+      new TestClient(build(strict, mgr, rnd.bytes)).send(
+        post("/act").withHeader("Authorization", "Bearer abc"),
+      ),
+      403,
+    );
+    const skipping = CsrfConfig {
+      ...defaultCsrfConfig(),
+      skip: (req: Request): bool => req.path() == "/act",
+    };
+    assertStatus(new TestClient(build(skipping, mgr, rnd.bytes)).send(post("/act")), 200);
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function configurationIsValidated(): void {
+  scope(s => {
+    const rnd = countingRandom(s);
+    assert(
+      CsrfProtection.create(defaultCsrfConfig(), fromString("short"), rnd.bytes).isErr(),
+      "short key",
+    );
+    assert(
+      CsrfProtection
+          .create(
+            CsrfConfig { ...defaultCsrfConfig(), headerName: "bad name" },
+            fromString(KEY),
+            rnd.bytes,
+          )
+          .isErr(),
+      "header",
+    );
+    assert(
+      CsrfProtection
+          .create(
+            CsrfConfig { ...defaultCsrfConfig(), mode: CsrfHeaderMode("bad name") },
+            fromString(KEY),
+            rnd.bytes,
+          )
+          .isErr(),
+      "required header",
+    );
+    assert(CsrfProtection.create(defaultCsrfConfig(), fromString(KEY), rnd.bytes).isOk(), "ok");
+    rnd.stop();
+  });
+}
+
+@Test
+function tokensAreFreshOnEveryIssue(): void {
+  scope(s => {
+    const store = MemorySessionStore.start(s);
+    const rnd = countingRandom(s);
+    const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
+    const c = new TestClient(build(defaultCsrfConfig(), mgr, rnd.bytes));
+    const a = mgr.login(testRequest(Get, "/"), 1000, "ann", [], []).unwrap();
+    const ann = c.withHeader("Cookie", "__Host-sid=" + a.id);
+    const t1 = ann.get("/form").bodyText();
+    const t2 = ann.get("/form").bodyText();
+    assert(t1 != t2, "a new nonce each time (BREACH)");
+    assertStatus(ann.send(post("/act").withHeader("X-CSRF-Token", t1)), 200);
+    assertStatus(ann.send(post("/act").withHeader("X-CSRF-Token", t2)), 200);
+    rnd.stop();
+    store.close();
+  });
+}

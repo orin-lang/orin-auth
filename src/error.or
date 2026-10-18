@@ -1,0 +1,28 @@
+// The error type shared by the parts of orin-auth that fail for operational reasons (ADR-0048 3.1: a `kind` and a renderer).
+// Authentication FAILURES of a request (wrong password, bad token) are not errors of this type: they are `false`, `None` or the
+// specific enumerations of each module (`JwtErrorKind`, `PasswordErrorKind`).
+export type AuthErrorKind =
+  ConfigInvalid // a configuration value that cannot work (empty cookie name, `__Host-` prefix without Secure, ...)
+  | InputInvalid // an argument the caller got wrong (a role name with a comma, an empty subject, ...)
+  | EntropyFailed // the random source failed or is not running: nothing was created
+  | ServiceUnavailable // a service task (store, clock, random) is not running
+  | FeatureUnsupported; // a feature that needs `std:crypto` (argon2id, RS256, ES256) or a network client
+
+export type AuthError = { kind: AuthErrorKind; message: string; };
+
+export function authError(kind: AuthErrorKind, message: string): AuthError {
+  return AuthError { kind: kind, message: message };
+}
+
+// authErrorMessage(e): string -- "kind: message", for logs. Never contains secrets: no function of this package puts a password,
+// token or key into a message.
+export function authErrorMessage(e: AuthError): string {
+  const k = match (e.kind) {
+    ConfigInvalid => "invalid configuration",
+    InputInvalid => "invalid input",
+    EntropyFailed => "no entropy",
+    ServiceUnavailable => "service unavailable",
+    FeatureUnsupported => "unsupported",
+  };
+  return k + ": " + e.message;
+}

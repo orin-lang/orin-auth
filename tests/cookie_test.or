@@ -1,0 +1,108 @@
+import { assert, assertEq, assertEqString, assertEqBool } from "std:test";
+import { Get } from "std:http";
+import { testRequest } from "orin-web";
+import {
+  CookieAttrs, SameSiteStrict, SameSiteNone, defaultCookieAttrs, setCookieValue, clearCookieValue,
+  parseCookieHeader, requestCookie, checkCookie,
+} from "../src/module";
+
+@Test
+function defaultAttributesAreSafe(): void {
+  const v = setCookieValue("sid", "abc", defaultCookieAttrs()).unwrap();
+  assertEqString(v, "sid=abc; Path=/; Secure; HttpOnly; SameSite=Lax", "default");
+}
+
+@Test
+function attributesAreConfigurable(): void {
+  const a = CookieAttrs {
+    ...defaultCookieAttrs(),
+    sameSite: SameSiteStrict,
+    maxAge: Some(3600),
+    domain: Some("example.com"),
+    httpOnly: false,
+  };
+  assertEqString(
+    setCookieValue("sid", "abc", a).unwrap(),
+    "sid=abc; Path=/; Domain=example.com; Max-Age=3600; Secure; SameSite=Strict",
+    "custom",
+  );
+}
+
+@Test
+function clearCookieExpiresIt(): void {
+  assertEqString(
+    clearCookieValue("sid", defaultCookieAttrs()).unwrap(),
+    "sid=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax",
+    "clear",
+  );
+}
+
+@Test
+function unsafeCookiesAreRefused(): void {
+  assert(setCookieValue("sid", "a;b", defaultCookieAttrs()).isErr(), "semicolon in value");
+  assert(setCookieValue("sid", "a b", defaultCookieAttrs()).isErr(), "space in value");
+  assert(
+    setCookieValue("sid", "a\r\nSet-Cookie: x=y", defaultCookieAttrs()).isErr(),
+    "header injection",
+  );
+  assert(setCookieValue("s id", "a", defaultCookieAttrs()).isErr(), "bad name");
+  assert(
+    setCookieValue(
+      "sid",
+      "a",
+      CookieAttrs { ...defaultCookieAttrs(), sameSite: SameSiteNone, secure: false },
+    ).isErr(),
+    "None without Secure",
+  );
+  assert(
+    setCookieValue("sid", "a", CookieAttrs { ...defaultCookieAttrs(), path: "x" }).isErr(),
+    "path",
+  );
+  assert(
+    setCookieValue("sid", "a", CookieAttrs { ...defaultCookieAttrs(), domain: Some("a;b") }).isErr(),
+    "domain",
+  );
+}
+
+@Test
+function hostPrefixIsEnforced(): void {
+  assert(setCookieValue("__Host-sid", "a", defaultCookieAttrs()).isOk(), "ok");
+  assert(
+    setCookieValue("__Host-sid", "a", CookieAttrs { ...defaultCookieAttrs(), secure: false }).isErr(),
+    "needs Secure",
+  );
+  assert(
+    setCookieValue(
+      "__Host-sid",
+      "a",
+      CookieAttrs { ...defaultCookieAttrs(), domain: Some("example.com") },
+    ).isErr(),
+    "no Domain",
+  );
+  assert(
+    setCookieValue("__Host-sid", "a", CookieAttrs { ...defaultCookieAttrs(), path: "/app" }).isErr(),
+    "Path=/",
+  );
+  assert(
+    setCookieValue("__Secure-x", "a", CookieAttrs { ...defaultCookieAttrs(), secure: false }).isErr(),
+    "__Secure-",
+  );
+}
+
+@Test
+function parsesCookieHeaders(): void {
+  const cs = parseCookieHeader("a=1; b=\"two\";  c = 3 ;broken; =x; d=");
+  assertEq(cs.length.toInt(), 4, "four usable pairs");
+  assertEqString(cs[0].key, "a", "a");
+  assertEqString(cs[1].value, "two", "quotes dropped");
+  assertEqString(cs[2].key, "c", "spaces trimmed");
+  assertEqString(cs[3].value, "", "empty value");
+}
+
+@Test
+function firstCookieOfANameWins(): void {
+  const req = testRequest(Get, "/").withHeader("Cookie", "sid=first; x=1; sid=second");
+  assertEqString(requestCookie(req, "sid").unwrap(), "first", "first");
+  assert(requestCookie(req, "nope").isNone(), "absent");
+  assertEqString(requestCookie(req, "x").unwrap(), "1", "other");
+}

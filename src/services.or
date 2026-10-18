@@ -1,0 +1,203 @@
+// The two things orin-auth cannot do on its own in Orin: read the wall clock and read OS entropy. Both need a grant, and a grant
+// cannot be captured by a closure (nor by an orin-web handler). So each is a small SERVICE TASK that holds the grant, and the
+// rest of orin-auth only sees a function value:
+//
+//   type NowFn    = () => int                                  milliseconds since the Unix epoch
+//   type RandomFn = (n: usize) => Result<Bytes, AuthError>     n cryptographically secure random bytes (n <= 4096)
+//
+// Start them once in `main`, inside a task scope that has the grants:
+//
+//   withHost(host, (fs, proc, stdio, clock) => {
+//     scopeFs(fs, (s, fsg) => {
+//       const random = startRandom(s, fsg);
+//       ...
+//       random.stop();
+//     });
+//   });
+//
+// `RandomFn` is the seam where `std:crypto`'s secure random source plugs in when it exists; applications never construct
+// session ids or tokens themselves.
+//
+// Randomness comes from /dev/urandom (the kernel CSPRNG, never blocks once seeded). On a platform without it `startRandom`'s
+// function returns `Err(EntropyFailed)` and orin-auth refuses to create ids: it never falls back to a weaker source.
+import { Bytes, fromString, fromArray, empty } from "std:bytes";
+import { Scope, Sender, Receiver, channel, spawnFs, spawnClock } from "std:task";
+import { FsGrant, File, Read, withFile } from "std:fs";
+import { ClockGrant, nowMillis } from "std:time";
+import { AuthError, authError, EntropyFailed, ServiceUnavailable, InputInvalid } from "./error";
+import { KvHandle, startKv } from "./internal/kv";
+import { sha256, textToBytes } from "./internal/crypto";
+
+export type NowFn = () => int;
+export type RandomFn = (n: usize) => Result<Bytes, AuthError>;
+
+// The largest request one call may make. Larger needs are loops in the caller (a session id is 32 bytes).
+export const MAX_RANDOM_REQUEST: usize = 4096;
+
+// A running service: `stop()` ends its task (the scope waits for the task, so stop before the scope body returns).
+export type ClockService = { now: NowFn; stop: () => void; };
+export type RandomService = { bytes: RandomFn; stop: () => void; };
+
+// ---------------------------------------------------------------------------------------------------------------- clock
+
+// startClock(s, clock): ClockService -- a task that answers `now()` with `nowMillis`.
+export function startClock(s: Scope, clock: ClockGrant): ClockService {
+  const reqs = channel<Sender<int>>(64);
+  const rx = reqs.rx;
+  spawnClock(
+    s,
+    clock,
+    (g: ClockGrant): int => {
+      let served: int = 0;
+      let going = true;
+      while (going) {
+        match (rx.recv()) {
+          Some(reply) => {
+            reply.send(nowMillis(g));
+            served += 1;
+          },
+          None => {
+            going = false;
+          },
+        }
+      }
+      rx.close();
+      return served;
+    },
+  );
+  const tx = reqs.tx;
+  const now = (): int => {
+    const r = channel<int>(1);
+    if (tx.send(r.tx).isErr()) {
+      return 0;
+    }
+    const v = r.rx.recv();
+    r.rx.close();
+    r.tx.close();
+    return v.unwrapOr(0);
+  };
+  return ClockService { now: now, stop: (): void => tx.close() };
+}
+
+// fixedClock(ms): NowFn -- a clock that always reads `ms`. For tests and examples.
+export function fixedClock(ms: int): NowFn {
+  return (): int => ms;
+}
+
+// ---------------------------------------------------------------------------------------------------------------- random
+
+type RandomRequest = { n: usize; reply: Sender<Option<string>>; };
+
+// Reads exactly `n` bytes, or None.
+function readExactly(f: File, n: usize): Option<string> {
+  let out = "";
+  while (out.length < n) {
+    const part = f.read(n - out.length);
+    if (part.isNone() || part.unwrap().length == 0) {
+      return None;
+    }
+    out = out + part.unwrap();
+  }
+  return Some(out);
+}
+
+// startRandom(s, fs): RandomService -- a task that keeps /dev/urandom open and answers byte requests. `fs` must allow reading
+// /dev/urandom (the grant of `main`, or one narrowed with `useUnder(fs, "/dev", ...)`).
+export function startRandom(s: Scope, fs: FsGrant): RandomService {
+  const reqs = channel<RandomRequest>(64);
+  const rx = reqs.rx;
+  spawnFs(
+    s,
+    fs,
+    (g: FsGrant): int => {
+      const served = withFile(
+        g,
+        "/dev/urandom",
+        Read,
+        (f: File): int => {
+          let n: int = 0;
+          let going = true;
+          while (going) {
+            match (rx.recv()) {
+              Some(req) => {
+                req.reply.send(readExactly(f, req.n));
+                n += 1;
+              },
+              None => {
+                going = false;
+              },
+            }
+          }
+          return n;
+        },
+      );
+      // If the source could not be opened, close the channel so that callers get Err at once instead of waiting.
+      rx.close();
+      return served.isOk() ? served.unwrap() : -1;
+    },
+  );
+  const tx = reqs.tx;
+  const bytes = (n: usize): Result<Bytes, AuthError> => {
+    if (n == 0) {
+      return Ok(empty());
+    }
+    if (n > MAX_RANDOM_REQUEST) {
+      return Err(authError(InputInvalid, "random request is larger than 4096 bytes"));
+    }
+    const r = channel<Option<string>>(1);
+    if (tx.send(RandomRequest { n: n, reply: r.tx }).isErr()) {
+      return Err(authError(EntropyFailed, "the random source is not running"));
+    }
+    const got = r.rx.recv();
+    r.rx.close();
+    r.tx.close();
+    if (got.isNone() || got.unwrap().isNone()) {
+      return Err(authError(EntropyFailed, "the random source failed"));
+    }
+    return Ok(fromString(got.unwrap().unwrap()));
+  };
+  return RandomService { bytes: bytes, stop: (): void => tx.close() };
+}
+
+// constantRandom(byte): RandomFn -- "random" bytes that are all `byte`. ONLY for tests that need a predictable value; never
+// give it to a session manager that serves requests.
+export function constantRandom(byte: u8): RandomFn {
+  return (n: usize): Result<Bytes, AuthError> => {
+    let xs: u8[] = [];
+    let i: usize = 0;
+    while (i < n) {
+      xs.push(byte);
+      i += 1;
+    }
+    return Ok(fromArray(xs));
+  };
+}
+
+// failingRandom(): RandomFn -- always `Err(EntropyFailed)`. For tests of the failure paths.
+export function failingRandom(): RandomFn {
+  return (n: usize): Result<Bytes, AuthError> => Err(authError(EntropyFailed, "no entropy (test)"));
+}
+
+// countingRandom(s): RandomService -- TEST ONLY. Distinct, reproducible bytes: block k of the stream is SHA-256 of the counter. It is
+// predictable by design (a session id made from it is guessable); it exists so that tests can create many sessions without a
+// kernel entropy source. Never use it in an application.
+export function countingRandom(s: Scope): RandomService {
+  const kv = startKv<int>(s);
+  const bytes = (n: usize): Result<Bytes, AuthError> => {
+    let out: u8[] = [];
+    while (out.length < n) {
+      const c = kv.update("n", (cur: Option<int>): Option<int> => Some(cur.unwrapOr(0) + 1));
+      if (c.isNone()) {
+        return Err(authError(EntropyFailed, "the counter service is gone"));
+      }
+      const block = sha256(textToBytes("orin-auth test random " + c.unwrap().toString())).toArray();
+      for (const b of block) {
+        if (out.length < n) {
+          out.push(b);
+        }
+      }
+    }
+    return Ok(fromArray(out));
+  };
+  return RandomService { bytes: bytes, stop: (): void => kv.close() };
+}
