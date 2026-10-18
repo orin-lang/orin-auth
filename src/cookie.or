@@ -20,7 +20,14 @@ export type CookieAttrs = {
 
 // defaultCookieAttrs(): CookieAttrs -- `Path=/; Secure; HttpOnly; SameSite=Lax`, host-only, a session cookie.
 export function defaultCookieAttrs(): CookieAttrs {
-  return CookieAttrs { path: "/", domain: None, maxAge: None, secure: true, httpOnly: true, sameSite: SameSiteLax };
+  return CookieAttrs {
+    path: "/",
+    domain: None,
+    maxAge: None,
+    secure: true,
+    httpOnly: true,
+    sameSite: SameSiteLax,
+  };
 }
 
 export function sameSiteName(s: SameSite): string {
@@ -33,7 +40,11 @@ export function sameSiteName(s: SameSite): string {
 
 // A cookie-octet (RFC 6265 4.1.1): printable ASCII except space, DQUOTE, comma, semicolon and backslash.
 function isCookieOctet(c: int): bool {
-  return c == 33 || (c >= 35 && c <= 43) || (c >= 45 && c <= 58) || (c >= 60 && c <= 91) || (c >= 93 && c <= 126);
+  return c == 33
+      || c >= 35 && c <= 43
+      || c >= 45 && c <= 58
+      || c >= 60 && c <= 91
+      || c >= 93 && c <= 126;
 }
 
 export function isCookieValue(v: string): bool {
@@ -66,7 +77,11 @@ function isDomainValue(v: string): bool {
   let i: usize = 0;
   while (i < v.length) {
     const c = v.charCodeAt(i).toInt();
-    const ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 45 || c == 46;
+    const ok = c >= 48 && c <= 57
+        || c >= 97 && c <= 122
+        || c >= 65 && c <= 90
+        || c == 45
+        || c == 46;
     if (!ok) {
       return false;
     }
@@ -79,7 +94,11 @@ function isDomainValue(v: string): bool {
 //   * the name is an HTTP token and the value has only cookie-octets (no `;`, no space, no control characters),
 //   * `SameSite=None` needs `Secure`,
 //   * `__Host-` needs Secure, Path=/ and no Domain; `__Secure-` needs Secure.
-export function checkCookie(name: string, value: string, attrs: CookieAttrs): Result<void, AuthError> {
+export function checkCookie(
+  name: string,
+  value: string,
+  attrs: CookieAttrs,
+): Result<void, AuthError> {
   if (!isToken(name)) {
     return Err(authError(ConfigInvalid, "cookie name is not a valid token"));
   }
@@ -87,7 +106,9 @@ export function checkCookie(name: string, value: string, attrs: CookieAttrs): Re
     return Err(authError(InputInvalid, "cookie value has characters that are not allowed"));
   }
   if (!isPathValue(attrs.path)) {
-    return Err(authError(ConfigInvalid, "cookie path must start with / and have no control characters or ;"));
+    return Err(
+      authError(ConfigInvalid, "cookie path must start with / and have no control characters or ;"),
+    );
   }
   if (attrs.domain.isSome() && !isDomainValue(attrs.domain.unwrap())) {
     return Err(authError(ConfigInvalid, "cookie domain has characters that are not allowed"));
@@ -111,7 +132,11 @@ export function checkCookie(name: string, value: string, attrs: CookieAttrs): Re
 }
 
 // setCookieValue(name, value, attrs): Result<string, AuthError> -- the value of a `Set-Cookie` header field.
-export function setCookieValue(name: string, value: string, attrs: CookieAttrs): Result<string, AuthError> {
+export function setCookieValue(
+  name: string,
+  value: string,
+  attrs: CookieAttrs,
+): Result<string, AuthError> {
   checkCookie(name, value, attrs)?;
   let out = name + "=" + value + "; Path=" + attrs.path;
   if (attrs.domain.isSome()) {

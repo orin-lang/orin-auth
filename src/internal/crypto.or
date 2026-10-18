@@ -50,7 +50,7 @@ export function hmacSha256Key(key: Bytes): HmacKey {
 
 // hmacWith(k, data): Bytes -- HMAC-SHA-256 with a prepared key.
 export function hmacWith(k: HmacKey, data: Bytes): Bytes {
-  const full = (data.length() / 64) * 64;
+  const full = data.length() / 64 * 64;
   const h = compressBlocks(k.table, k.inner, data.slice(0, full));
   const inner = sha256Finish(k.table, h, data.slice(full, data.length()), 64 + full);
   return sha256Finish(k.table, k.outer, inner, 64);
@@ -63,7 +63,12 @@ export function hmacSha256(key: Bytes, data: Bytes): Bytes {
 
 // pbkdf2HmacSha256(password, salt, iterations, length): Bytes -- RFC 8018 PBKDF2 with HMAC-SHA-256. Requires iterations >= 1 and
 // length >= 1 (a violation traps: the callers validate parameters before).
-export function pbkdf2HmacSha256(password: Bytes, salt: Bytes, iterations: int, length: usize): Bytes {
+export function pbkdf2HmacSha256(
+  password: Bytes,
+  salt: Bytes,
+  iterations: int,
+  length: usize,
+): Bytes {
   assertPositive(iterations, length);
   const k = hmacSha256Key(password);
   let out = new ByteBuilder();
@@ -128,6 +133,11 @@ export function constantTimeEqualsText(a: string, b: string): bool {
 // base64UrlEncode(data): string -- RFC 4648 section 5 without padding.
 export function base64UrlEncode(data: Bytes): string {
   return encoding.base64UrlEncode(data, encoding.Unpadded);
+}
+
+// base64Encode(data): string -- standard alphabet with padding (HTTP Basic credentials).
+export function base64Encode(data: Bytes): string {
+  return encoding.base64Encode(data, encoding.Padded);
 }
 
 // base64UrlDecode(text): Option<Bytes> -- strict (no padding, no whitespace, canonical).

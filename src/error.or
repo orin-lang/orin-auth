@@ -2,11 +2,11 @@
 // Authentication FAILURES of a request (wrong password, bad token) are not errors of this type: they are `false`, `None` or the
 // specific enumerations of each module (`JwtErrorKind`, `PasswordErrorKind`).
 export type AuthErrorKind =
-  ConfigInvalid       // a configuration value that cannot work (empty cookie name, `__Host-` prefix without Secure, ...)
-  | InputInvalid      // an argument the caller got wrong (a role name with a comma, an empty subject, ...)
-  | EntropyFailed           // the random source failed or is not running: nothing was created
-  | ServiceUnavailable       // a service task (store, clock, random) is not running
-  | FeatureUnsupported;      // a feature that needs `std:crypto` (argon2id, RS256, ES256) or a network client
+  ConfigInvalid // a configuration value that cannot work (empty cookie name, `__Host-` prefix without Secure, ...)
+  | InputInvalid // an argument the caller got wrong (a role name with a comma, an empty subject, ...)
+  | EntropyFailed // the random source failed or is not running: nothing was created
+  | ServiceUnavailable // a service task (store, clock, random) is not running
+  | FeatureUnsupported; // a feature that needs `std:crypto` (argon2id, RS256, ES256) or a network client
 
 export type AuthError = { kind: AuthErrorKind; message: string; };
 

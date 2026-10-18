@@ -9,7 +9,9 @@
 // attacker who invents keys cannot both fill memory and escape the limit. State is per process: behind several instances either
 // pin a client to one instance or use a shared limiter.
 import { Scope } from "std:task";
-import { Request, Response, WebError, Handler, Middleware, statusError, withErrorHeader } from "orin-web";
+import {
+  Request, Response, WebError, Handler, Middleware, statusError, withErrorHeader,
+} from "orin-web";
 import { AuthError, authError, ConfigInvalid } from "./error";
 import { NowFn } from "./services";
 import { KvHandle, startKv } from "./internal/kv";
@@ -28,7 +30,9 @@ export type RateDecision = { allowed: bool; retryAfterMs: int; remaining: int; }
 
 function refilled(cfg: RateLimitConfig, b: Bucket, now: int): int {
   const elapsed = now > b.at ? now - b.at : 0;
-  const gained = elapsed >= cfg.capacity * cfg.refillEveryMs ? cfg.capacity * 1000 : elapsed * 1000 / cfg.refillEveryMs;
+  const gained = elapsed >= cfg.capacity * cfg.refillEveryMs
+      ? cfg.capacity * 1000
+      : elapsed * 1000 / cfg.refillEveryMs;
   const total = b.milli + gained;
   return total > cfg.capacity * 1000 ? cfg.capacity * 1000 : total;
 }
@@ -74,7 +78,11 @@ export class RateLimiter {
       return RateDecision { allowed: false, retryAfterMs: cfg.refillEveryMs, remaining: 0 };
     }
     const b = next.unwrap();
-    return RateDecision { allowed: b.allowed, retryAfterMs: b.retryAfterMs, remaining: b.milli / 1000 };
+    return RateDecision {
+      allowed: b.allowed,
+      retryAfterMs: b.retryAfterMs,
+      remaining: b.milli / 1000,
+    };
   }
 
   // reset(key): forgets the key (call after a successful login).
@@ -100,7 +108,11 @@ export class RateLimiter {
 // rateLimit(limiter, keyOf, now): Middleware -- 429 Too Many Requests with `Retry-After` (whole seconds, rounded up) when the key of
 // the request has no token left. `keyOf` returns None for requests that are not limited. The key is yours to choose (a
 // user name from the body, a forwarded address header set by your proxy); the middleware does not guess an IP address.
-export function rateLimit(limiter: RateLimiter, keyOf: (req: Request) => Option<string>, now: NowFn): Middleware {
+export function rateLimit(
+  limiter: RateLimiter,
+  keyOf: (req: Request) => Option<string>,
+  now: NowFn,
+): Middleware {
   return (req: Request, next: Handler): Result<Response, WebError> => {
     const key = keyOf(req);
     if (key.isNone()) {
@@ -111,6 +123,12 @@ export function rateLimit(limiter: RateLimiter, keyOf: (req: Request) => Option<
       return next(req);
     }
     const secs = (d.retryAfterMs + 999) / 1000;
-    return Err(withErrorHeader(statusError(429, "too many attempts"), "Retry-After", (secs < 1 ? 1 : secs).toString()));
+    return Err(
+      withErrorHeader(
+        statusError(429, "too many attempts"),
+        "Retry-After",
+        (secs < 1 ? 1 : secs).toString(),
+      ),
+    );
   };
 }

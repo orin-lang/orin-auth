@@ -2,17 +2,25 @@ import { assert, assertEq, assertEqString, assertEqBool, fail } from "std:test";
 import { Get, Post } from "std:http";
 import { scope } from "std:task";
 import {
-  Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertBody, assertHeader, withMiddleware,
+  Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertBody,
+  assertHeader, withMiddleware,
 } from "orin-web";
 import {
-  MemoryApiTokenStore, ApiTokenRecord, TokenSpec, issueApiToken, verifyApiToken, revokeApiToken, splitToken, isValidTokenPrefix, tokenFailureText,
-  TokenValid, TokenInvalid, TokenMalformed, TokenUnknown, TokenWrongSecret, TokenExpired, TokenRevoked, apiTokenAuthenticator,
-  authenticate, fixedClock, countingRandom, failingRandom, requireScope, defaultAuthzConfig, principalOf, ViaApiToken,
-  authMethodName, hasScope,
+  MemoryApiTokenStore, ApiTokenRecord, TokenSpec, issueApiToken, verifyApiToken, revokeApiToken,
+  splitToken, isValidTokenPrefix, tokenFailureText, TokenValid, TokenInvalid, TokenMalformed,
+  TokenUnknown, TokenWrongSecret, TokenExpired, TokenRevoked, apiTokenAuthenticator, authenticate,
+  fixedClock, countingRandom, failingRandom, requireScope, defaultAuthzConfig, principalOf,
+  ViaApiToken, authMethodName, hasScope,
 } from "../src/module";
 
 function spec(scopes: string[]): TokenSpec {
-  return TokenSpec { subject: "svc-ci", name: "ci deploy", roles: [], scopes: scopes, expiresAt: None };
+  return TokenSpec {
+    subject: "svc-ci",
+    name: "ci deploy",
+    roles: [],
+    scopes: scopes,
+    expiresAt: None,
+  };
 }
 
 @Test
@@ -60,17 +68,41 @@ function everyKindOfBadTokenIsRefused(): void {
     const t = issueApiToken(store, rnd.bytes, "orbit", spec([]), 1000).unwrap();
     const id = t.record.id;
     const secret = splitToken("orbit", t.token).unwrap()[1];
-    match (verifyApiToken(store, "orbit", "orbit_short", 2000)) { TokenInvalid(TokenMalformed) => {}, _ => fail("short") }
-    match (verifyApiToken(store, "orbit", "other_" + id + "_" + secret, 2000)) { TokenInvalid(TokenMalformed) => {}, _ => fail("wrong prefix") }
-    match (verifyApiToken(store, "orbit", t.token + "x", 2000)) { TokenInvalid(TokenMalformed) => {}, _ => fail("long") }
-    match (verifyApiToken(store, "orbit", "orbit_" + id + "-" + secret, 2000)) { TokenInvalid(TokenMalformed) => {}, _ => fail("bad separator") }
-    match (verifyApiToken(store, "orbit", "orbit_zzzzzzzzzzzzzzzzzzzzzzzz_" + secret, 2000)) { TokenInvalid(TokenMalformed) => {}, _ => fail("non-hex id") }
-    match (verifyApiToken(store, "orbit", "orbit_000000000000000000000000_" + secret, 2000)) { TokenInvalid(TokenUnknown) => {}, _ => fail("unknown id") }
+    match (verifyApiToken(store, "orbit", "orbit_short", 2000)) {
+      TokenInvalid(TokenMalformed) => {},
+      _ => fail("short"),
+    }
+    match (verifyApiToken(store, "orbit", "other_" + id + "_" + secret, 2000)) {
+      TokenInvalid(TokenMalformed) => {},
+      _ => fail("wrong prefix"),
+    }
+    match (verifyApiToken(store, "orbit", t.token + "x", 2000)) {
+      TokenInvalid(TokenMalformed) => {},
+      _ => fail("long"),
+    }
+    match (verifyApiToken(store, "orbit", "orbit_" + id + "-" + secret, 2000)) {
+      TokenInvalid(TokenMalformed) => {},
+      _ => fail("bad separator"),
+    }
+    match (verifyApiToken(store, "orbit", "orbit_zzzzzzzzzzzzzzzzzzzzzzzz_" + secret, 2000)) {
+      TokenInvalid(TokenMalformed) => {},
+      _ => fail("non-hex id"),
+    }
+    match (verifyApiToken(store, "orbit", "orbit_000000000000000000000000_" + secret, 2000)) {
+      TokenInvalid(TokenUnknown) => {},
+      _ => fail("unknown id"),
+    }
     const flipped = secret.substring(0, 42) + (secret.substring(42, 43) == "A" ? "B" : "A");
-    match (verifyApiToken(store, "orbit", "orbit_" + id + "_" + flipped, 2000)) { TokenInvalid(TokenWrongSecret) => {}, _ => fail("wrong secret") }
+    match (verifyApiToken(store, "orbit", "orbit_" + id + "_" + flipped, 2000)) {
+      TokenInvalid(TokenWrongSecret) => {},
+      _ => fail("wrong secret"),
+    }
     // someone who knows the id but not the secret learns nothing about expiry or revocation
     revokeApiToken(store, id);
-    match (verifyApiToken(store, "orbit", "orbit_" + id + "_" + flipped, 2000)) { TokenInvalid(TokenUnknown) => {}, _ => fail("revoked = removed") }
+    match (verifyApiToken(store, "orbit", "orbit_" + id + "_" + flipped, 2000)) {
+      TokenInvalid(TokenUnknown) => {},
+      _ => fail("revoked = removed"),
+    }
     rnd.stop();
     store.close();
   });
@@ -81,11 +113,35 @@ function expiryIsEnforced(): void {
   scope(s => {
     const store = MemoryApiTokenStore.start(s);
     const rnd = countingRandom(s);
-    const t = issueApiToken(store, rnd.bytes, "orbit", TokenSpec { ...spec([]), expiresAt: Some(5000) }, 1000).unwrap();
-    match (verifyApiToken(store, "orbit", t.token, 4999)) { TokenValid(r) => {}, _ => fail("before expiry") }
-    match (verifyApiToken(store, "orbit", t.token, 5000)) { TokenInvalid(TokenExpired) => {}, _ => fail("at expiry") }
-    match (verifyApiToken(store, "orbit", t.token, 9000)) { TokenInvalid(TokenExpired) => {}, _ => fail("after expiry") }
-    assert(issueApiToken(store, rnd.bytes, "orbit", TokenSpec { ...spec([]), expiresAt: Some(1000) }, 1000).isErr(), "expiry must be in the future");
+    const t = issueApiToken(
+      store,
+      rnd.bytes,
+      "orbit",
+      TokenSpec { ...spec([]), expiresAt: Some(5000) },
+      1000,
+    ).unwrap();
+    match (verifyApiToken(store, "orbit", t.token, 4999)) {
+      TokenValid(r) => {},
+      _ => fail("before expiry"),
+    }
+    match (verifyApiToken(store, "orbit", t.token, 5000)) {
+      TokenInvalid(TokenExpired) => {},
+      _ => fail("at expiry"),
+    }
+    match (verifyApiToken(store, "orbit", t.token, 9000)) {
+      TokenInvalid(TokenExpired) => {},
+      _ => fail("after expiry"),
+    }
+    assert(
+      issueApiToken(
+        store,
+        rnd.bytes,
+        "orbit",
+        TokenSpec { ...spec([]), expiresAt: Some(1000) },
+        1000,
+      ).isErr(),
+      "expiry must be in the future",
+    );
     rnd.stop();
     store.close();
   });
@@ -98,7 +154,10 @@ function revokedFlagIsHonouredForStoresThatKeepRecords(): void {
     const rnd = countingRandom(s);
     const t = issueApiToken(store, rnd.bytes, "orbit", spec([]), 1000).unwrap();
     store.save(ApiTokenRecord { ...t.record, revoked: true });
-    match (verifyApiToken(store, "orbit", t.token, 2000)) { TokenInvalid(TokenRevoked) => {}, _ => fail("revoked") }
+    match (verifyApiToken(store, "orbit", t.token, 2000)) {
+      TokenInvalid(TokenRevoked) => {},
+      _ => fail("revoked"),
+    }
     rnd.stop();
     store.close();
   });
@@ -111,12 +170,27 @@ function revokeDeletesAndRemoveSubjectEndsAllOfAUser(): void {
     const rnd = countingRandom(s);
     const a = issueApiToken(store, rnd.bytes, "orbit", spec([]), 1000).unwrap();
     const b = issueApiToken(store, rnd.bytes, "orbit", spec([]), 1000).unwrap();
-    const c = issueApiToken(store, rnd.bytes, "orbit", TokenSpec { ...spec([]), subject: "other" }, 1000).unwrap();
+    const c = issueApiToken(
+      store,
+      rnd.bytes,
+      "orbit",
+      TokenSpec { ...spec([]), subject: "other" },
+      1000,
+    ).unwrap();
     assertEqBool(revokeApiToken(store, a.record.id), true, "revoked");
-    match (verifyApiToken(store, "orbit", a.token, 2000)) { TokenInvalid(TokenUnknown) => {}, _ => fail("a gone") }
+    match (verifyApiToken(store, "orbit", a.token, 2000)) {
+      TokenInvalid(TokenUnknown) => {},
+      _ => fail("a gone"),
+    }
     assertEq(store.removeSubject("svc-ci"), 1, "b removed");
-    match (verifyApiToken(store, "orbit", b.token, 2000)) { TokenInvalid(TokenUnknown) => {}, _ => fail("b gone") }
-    match (verifyApiToken(store, "orbit", c.token, 2000)) { TokenValid(r) => {}, _ => fail("c stays") }
+    match (verifyApiToken(store, "orbit", b.token, 2000)) {
+      TokenInvalid(TokenUnknown) => {},
+      _ => fail("b gone"),
+    }
+    match (verifyApiToken(store, "orbit", c.token, 2000)) {
+      TokenValid(r) => {},
+      _ => fail("c stays"),
+    }
     rnd.stop();
     store.close();
   });
@@ -132,9 +206,18 @@ function inputsAreValidated(): void {
     assertEqBool(isValidTokenPrefix("Orbit"), false, "uppercase");
     assertEqBool(isValidTokenPrefix("or_bit"), false, "underscore");
     assert(issueApiToken(store, rnd.bytes, "bad_prefix", spec([]), 1).isErr(), "prefix");
-    assert(issueApiToken(store, rnd.bytes, "orbit", TokenSpec { ...spec([]), subject: "" }, 1).isErr(), "subject");
-    assert(issueApiToken(store, rnd.bytes, "orbit", spec(["a b"]), 1).isErr(), "scope with a space");
-    assert(issueApiToken(store, rnd.bytes, "orbit", spec(["a,b"]), 1).isErr(), "scope with a comma");
+    assert(
+      issueApiToken(store, rnd.bytes, "orbit", TokenSpec { ...spec([]), subject: "" }, 1).isErr(),
+      "subject",
+    );
+    assert(
+      issueApiToken(store, rnd.bytes, "orbit", spec(["a b"]), 1).isErr(),
+      "scope with a space",
+    );
+    assert(
+      issueApiToken(store, rnd.bytes, "orbit", spec(["a,b"]), 1).isErr(),
+      "scope with a comma",
+    );
     assert(issueApiToken(store, failingRandom(), "orbit", spec([]), 1).isErr(), "no entropy");
     assertEq(store.size(), 0, "nothing stored on failure");
     assertEqString(tokenFailureText(TokenExpired), "token expired", "text");
@@ -152,18 +235,48 @@ function bearerAuthenticationThroughTheMiddleware(): void {
     const weak = issueApiToken(store, rnd.bytes, "orbit", spec(["read"]), 1000).unwrap();
     let app = new Router();
     app.use(authenticate([apiTokenAuthenticator(store, "orbit")], fixedClock(2000)));
-    app.get("/who", (req: Request): Result<Response, WebError> => {
-      const p = principalOf(req);
-      return Ok(Response.text(200, p.isSome() ? p.unwrap().subject + " via " + authMethodName(p.unwrap().method) : "anonymous"));
-    });
-    app.post("/deploy", withMiddleware(requireScope(defaultAuthzConfig(), "deploy"), (req: Request): Result<Response, WebError> => Ok(Response.text(200, "deployed"))));
+    app.get(
+      "/who",
+      (req: Request): Result<Response, WebError> => {
+        const p = principalOf(req);
+        return Ok(
+          Response.text(
+            200,
+            p.isSome()
+                ? p.unwrap().subject + " via " + authMethodName(p.unwrap().method)
+                : "anonymous",
+          ),
+        );
+      },
+    );
+    app.post(
+      "/deploy",
+      withMiddleware(
+        requireScope(defaultAuthzConfig(), "deploy"),
+        (req: Request): Result<Response, WebError> => Ok(Response.text(200, "deployed")),
+      ),
+    );
     const c = new TestClient(app);
     assertBody(c.get("/who"), "anonymous");
-    assertBody(c.withHeader("Authorization", "Bearer " + good.token).get("/who"), "svc-ci via api-token");
-    assertStatus(c.withHeader("Authorization", "Bearer " + good.token).send(testRequest(Post, "/deploy")), 200);
-    assertStatus(c.withHeader("Authorization", "Bearer " + weak.token).send(testRequest(Post, "/deploy")), 403);
+    assertBody(
+      c.withHeader("Authorization", "Bearer " + good.token).get("/who"),
+      "svc-ci via api-token",
+    );
+    assertStatus(
+      c.withHeader("Authorization", "Bearer " + good.token).send(testRequest(Post, "/deploy")),
+      200,
+    );
+    assertStatus(
+      c.withHeader("Authorization", "Bearer " + weak.token).send(testRequest(Post, "/deploy")),
+      403,
+    );
     assertStatus(c.send(testRequest(Post, "/deploy")), 401);
-    const bad = c.withHeader("Authorization", "Bearer orbit_000000000000000000000000_" + splitToken("orbit", good.token).unwrap()[1]).get("/who");
+    const bad = c
+        .withHeader(
+          "Authorization",
+          "Bearer orbit_000000000000000000000000_" + splitToken("orbit", good.token).unwrap()[1],
+        )
+        .get("/who");
     assertStatus(bad, 401);
     assertHeader(bad, "WWW-Authenticate", "Bearer error=\"invalid_token\"");
     // a bearer credential that is not ours (a JWT) is anonymous for this authenticator

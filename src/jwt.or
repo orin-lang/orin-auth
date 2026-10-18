@@ -19,15 +19,17 @@
 // else (header, kid, alg checks, claims) is shared. Signing with RS256 / ES256 is out of scope.
 import { Bytes, fromString } from "std:bytes";
 import {
-  JsonValue, JsonMember, ValueNull, ValueBool, ValueNumber, ValueString, ValueArray, ValueObject, parseDocument, writeDocument,
-  defaultReadOptions, defaultLimits,
+  JsonValue, JsonMember, ValueNull, ValueBool, ValueNumber, ValueString, ValueArray, ValueObject,
+  parseDocument, writeDocument, defaultReadOptions, defaultLimits,
 } from "std:json";
 import { numberFromInt, numberAsInt } from "std:json/number";
 import { toLowerAscii } from "std:http";
 import { Request } from "orin-web";
 import { AuthError, authError, ConfigInvalid, InputInvalid, FeatureUnsupported } from "./error";
 import { Principal, ViaJwt } from "./principal";
-import { AuthOutcome, AuthAnonymous, AuthPassed, AuthFailed, Authenticator, noExtras } from "./authn";
+import {
+  AuthOutcome, AuthAnonymous, AuthPassed, AuthFailed, Authenticator, noExtras,
+} from "./authn";
 import {
   hmacSha256, constantTimeEquals, base64UrlEncode, base64UrlDecode, textToBytes, bytesToText,
 } from "./internal/crypto";
@@ -58,7 +60,9 @@ function jwtAlgOf(name: string): Option<JwtAlg> {
 // signingInput = ASCII(BASE64URL(header) "." BASE64URL(payload)); signature = the decoded third part.
 export type SignatureVerifier = (signingInput: Bytes, signature: Bytes) => bool;
 
-export type JwtKey = JwtSecret(Option<string>, Bytes) | JwtExternalKey(Option<string>, JwtAlg, SignatureVerifier);
+export type JwtKey =
+  JwtSecret(Option<string>, Bytes)
+  | JwtExternalKey(Option<string>, JwtAlg, SignatureVerifier);
 
 export const MIN_HMAC_KEY_BYTES: usize = 32;
 
@@ -73,7 +77,11 @@ export function jwtSecret(kid: Option<string>, secret: Bytes): Result<JwtKey, Au
 
 // jwtExternalKey(kid, alg, verifier): Result<JwtKey, AuthError> -- a key checked by `verifier` (RS256 / ES256). `alg` must not be
 // HS256: an HMAC key is a `JwtSecret`, so no verifier function can be tricked into the symmetric case.
-export function jwtExternalKey(kid: Option<string>, alg: JwtAlg, verifier: SignatureVerifier): Result<JwtKey, AuthError> {
+export function jwtExternalKey(
+  kid: Option<string>,
+  alg: JwtAlg,
+  verifier: SignatureVerifier,
+): Result<JwtKey, AuthError> {
   return match (alg) {
     JwtHS256 => Err(authError(ConfigInvalid, "use jwtSecret for HS256")),
     _ => Ok(JwtExternalKey(kid, alg, verifier)),
@@ -97,13 +105,13 @@ function keyAlg(k: JwtKey): JwtAlg {
 // ------------------------------------------------------------------------------------------------------------------ errors
 
 export type JwtErrorKind =
-  JwtMalformed          // not three base64url parts, bad JSON, wrong claim types
+  JwtMalformed // not three base64url parts, bad JSON, wrong claim types
   | JwtTooLarge
-  | JwtAlgNone          // alg "none" (the unsecured JWT): never accepted
-  | JwtAlgUnsupported   // an alg this library does not know
-  | JwtAlgNotAllowed    // known, but not in the allow-list, or not the algorithm of the selected key
-  | JwtCritUnsupported  // a `crit` header
-  | JwtKeyUnknown       // no key for this kid
+  | JwtAlgNone // alg "none" (the unsecured JWT): never accepted
+  | JwtAlgUnsupported // an alg this library does not know
+  | JwtAlgNotAllowed // known, but not in the allow-list, or not the algorithm of the selected key
+  | JwtCritUnsupported // a `crit` header
+  | JwtKeyUnknown // no key for this kid
   | JwtBadSignature
   | JwtExpired
   | JwtNotYetValid
@@ -147,7 +155,12 @@ export function defaultJwtOptions(): JwtOptions {
   };
 }
 
-export type VerifiedJwt = { alg: JwtAlg; kid: Option<string>; header: JsonValue; claims: JsonValue; };
+export type VerifiedJwt = {
+  alg: JwtAlg;
+  kid: Option<string>;
+  header: JsonValue;
+  claims: JsonValue;
+};
 
 // ------------------------------------------------------------------------------------------------------------------ JSON helpers
 
@@ -274,7 +287,9 @@ export function signJwt(key: JwtKey, claims: JsonValue): Result<string, AuthErro
       const input = b64(h.unwrap()) + "." + b64(p.unwrap());
       return Ok(input + "." + base64UrlEncode(hmacSha256(secret, textToBytes(input))));
     },
-    JwtExternalKey(kid, a, v) => Err(authError(FeatureUnsupported, "signing with RS256 / ES256 is not implemented")),
+    JwtExternalKey(kid, a, v) => Err(
+      authError(FeatureUnsupported, "signing with RS256 / ES256 is not implemented"),
+    ),
   };
 }
 
@@ -316,7 +331,12 @@ function algAllowed(allowed: JwtAlg[], a: JwtAlg): bool {
 }
 
 // verifyJwt(token, keys, options, nowMs): Result<VerifiedJwt, JwtError> -- see the module comment for the order of checks.
-export function verifyJwt(token: string, keys: JwtKey[], options: JwtOptions, nowMs: int): Result<VerifiedJwt, JwtError> {
+export function verifyJwt(
+  token: string,
+  keys: JwtKey[],
+  options: JwtOptions,
+  nowMs: int,
+): Result<VerifiedJwt, JwtError> {
   if (token.length > options.maxTokenBytes) {
     return Err(jerr(JwtTooLarge, "token is too large"));
   }
@@ -374,7 +394,8 @@ export function verifyJwt(token: string, keys: JwtKey[], options: JwtOptions, no
   }
   const signingInput = textToBytes(parts[0] + "." + parts[1]);
   const sigOk = match (key.unwrap()) {
-    JwtSecret(k, secret) => signature.unwrap().length() == 32 && constantTimeEquals(signature.unwrap(), hmacSha256(secret, signingInput)),
+    JwtSecret(k, secret) => signature.unwrap().length() == 32
+        && constantTimeEquals(signature.unwrap(), hmacSha256(secret, signingInput)),
     JwtExternalKey(k, a, verify) => verify(signingInput, signature.unwrap()),
   };
   if (!sigOk) {
@@ -392,7 +413,12 @@ export function verifyJwt(token: string, keys: JwtKey[], options: JwtOptions, no
     },
   }
   checkClaims(claims.unwrap(), options, nowMs)?;
-  return Ok(VerifiedJwt { alg: alg.unwrap(), kid: kid, header: header.unwrap(), claims: claims.unwrap() });
+  return Ok(VerifiedJwt {
+    alg: alg.unwrap(),
+    kid: kid,
+    header: header.unwrap(),
+    claims: claims.unwrap(),
+  });
 }
 
 // A NumericDate claim: Ok(None) when absent, Err when present but not an integer.
@@ -456,7 +482,12 @@ export function jwtPrincipal(v: VerifiedJwt): Option<Principal> {
   for (const s of claimStrings(v.claims, "scp")) {
     scopes.push(s);
   }
-  return Some(Principal { subject: sub.unwrap(), roles: claimStrings(v.claims, "roles"), scopes: scopes, method: ViaJwt });
+  return Some(Principal {
+    subject: sub.unwrap(),
+    roles: claimStrings(v.claims, "roles"),
+    scopes: scopes,
+    method: ViaJwt,
+  });
 }
 
 // jwtAuthenticator(keys, options, toPrincipal): Authenticator -- authenticates `Authorization: Bearer <jwt>`. A bearer credential

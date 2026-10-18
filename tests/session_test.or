@@ -2,10 +2,13 @@ import { assert, assertEq, assertEqString, assertEqBool, fail } from "std:test";
 import { Get, Post } from "std:http";
 import { scope } from "std:task";
 import { QueryPair } from "std:url";
-import { Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertBody } from "orin-web";
 import {
-  MemorySessionStore, SessionManager, SessionConfig, SessionAnonymous, SessionActive, SessionExpired, defaultSessionConfig,
-  checkSessionConfig, countingRandom, failingRandom, sessionIdHash, CookieAttrs, SameSiteStrict, EntropyFailed,
+  Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertBody,
+} from "orin-web";
+import {
+  MemorySessionStore, SessionManager, SessionConfig, SessionAnonymous, SessionActive,
+  SessionExpired, defaultSessionConfig, checkSessionConfig, countingRandom, failingRandom,
+  sessionIdHash, CookieAttrs, SameSiteStrict, EntropyFailed,
 } from "../src/module";
 import { setCookieValueOf, setCookieFieldOf, hasAttr } from "./support";
 
@@ -58,7 +61,14 @@ function cookieAttributesAreConfigurable(): void {
     const cfg = SessionConfig {
       ...defaultSessionConfig(),
       cookieName: "sid",
-      cookie: CookieAttrs { path: "/app", domain: None, maxAge: None, secure: false, httpOnly: false, sameSite: SameSiteStrict },
+      cookie: CookieAttrs {
+        path: "/app",
+        domain: None,
+        maxAge: None,
+        secure: false,
+        httpOnly: false,
+        sameSite: SameSiteStrict,
+      },
       persistent: true,
     };
     const mgr = SessionManager.create(store, rnd.bytes, cfg).unwrap();
@@ -76,11 +86,33 @@ function cookieAttributesAreConfigurable(): void {
 @Test
 function configurationIsValidated(): void {
   assert(checkSessionConfig(defaultSessionConfig()).isOk(), "default is fine");
-  assert(checkSessionConfig(SessionConfig { ...defaultSessionConfig(), idBytes: 8 }).isErr(), "id under 128 bits");
-  assert(checkSessionConfig(SessionConfig { ...defaultSessionConfig(), idleTimeoutSeconds: 0 }).isErr(), "zero idle");
-  assert(checkSessionConfig(SessionConfig { ...defaultSessionConfig(), idleTimeoutSeconds: 100, absoluteTimeoutSeconds: 50 }).isErr(), "idle > absolute");
-  assert(checkSessionConfig(SessionConfig { ...defaultSessionConfig(), cookie: CookieAttrs { ...defaultSessionConfig().cookie, secure: false } }).isErr(), "__Host- needs Secure");
-  assert(checkSessionConfig(SessionConfig { ...defaultSessionConfig(), cookieName: "bad name" }).isErr(), "bad name");
+  assert(
+    checkSessionConfig(SessionConfig { ...defaultSessionConfig(), idBytes: 8 }).isErr(),
+    "id under 128 bits",
+  );
+  assert(
+    checkSessionConfig(SessionConfig { ...defaultSessionConfig(), idleTimeoutSeconds: 0 }).isErr(),
+    "zero idle",
+  );
+  assert(
+    checkSessionConfig(SessionConfig {
+      ...defaultSessionConfig(),
+      idleTimeoutSeconds: 100,
+      absoluteTimeoutSeconds: 50,
+    }).isErr(),
+    "idle > absolute",
+  );
+  assert(
+    checkSessionConfig(SessionConfig {
+      ...defaultSessionConfig(),
+      cookie: CookieAttrs { ...defaultSessionConfig().cookie, secure: false },
+    }).isErr(),
+    "__Host- needs Secure",
+  );
+  assert(
+    checkSessionConfig(SessionConfig { ...defaultSessionConfig(), cookieName: "bad name" }).isErr(),
+    "bad name",
+  );
 }
 
 @Test
@@ -97,7 +129,7 @@ function lookupFindsTheSessionAndRejectsTamperedIds(): void {
       },
       _ => fail("expected an active session"),
     }
-    const flipped = (made.id.substring(0, 42)) + (made.id.substring(42, 43) == "A" ? "B" : "A");
+    const flipped = made.id.substring(0, 42) + (made.id.substring(42, 43) == "A" ? "B" : "A");
     match (mgr.lookup(withCookie(flipped), 2000)) {
       SessionAnonymous => {},
       _ => fail("a tampered id must be anonymous"),
@@ -176,7 +208,11 @@ function rotateKeepsTheDataAndTheAbsoluteExpiry(): void {
     assert(first.id != second.id, "new id");
     assertEqString(second.record.subject, "ann", "same subject");
     assert(second.record.roles == ["admin"], "same roles");
-    assertEq(second.record.absoluteExpiresAt, first.record.absoluteExpiresAt, "absolute expiry is not extended by rotation");
+    assertEq(
+      second.record.absoluteExpiresAt,
+      first.record.absoluteExpiresAt,
+      "absolute expiry is not extended by rotation",
+    );
     assertEq(second.record.createdAt, 1000, "creation time kept");
     match (mgr.lookup(withCookie(first.id), 6000)) {
       SessionAnonymous => {},
@@ -193,7 +229,12 @@ function idleTimeoutExpiresAndSlidingRenews(): void {
   scope(s => {
     const store = MemorySessionStore.start(s);
     const rnd = countingRandom(s);
-    const cfg = SessionConfig { ...defaultSessionConfig(), idleTimeoutSeconds: 100, absoluteTimeoutSeconds: 1000, touchIntervalSeconds: 10 };
+    const cfg = SessionConfig {
+      ...defaultSessionConfig(),
+      idleTimeoutSeconds: 100,
+      absoluteTimeoutSeconds: 1000,
+      touchIntervalSeconds: 10,
+    };
     const mgr = SessionManager.create(store, rnd.bytes, cfg).unwrap();
     const made = mgr.login(testRequest(Get, "/"), 0, "ann", [], []).unwrap();
     assertEq(made.record.idleExpiresAt, 100000, "idle expiry");
@@ -223,11 +264,20 @@ function touchIntervalLimitsWrites(): void {
   scope(s => {
     const store = MemorySessionStore.start(s);
     const rnd = countingRandom(s);
-    const cfg = SessionConfig { ...defaultSessionConfig(), idleTimeoutSeconds: 100, absoluteTimeoutSeconds: 1000, touchIntervalSeconds: 60 };
+    const cfg = SessionConfig {
+      ...defaultSessionConfig(),
+      idleTimeoutSeconds: 100,
+      absoluteTimeoutSeconds: 1000,
+      touchIntervalSeconds: 60,
+    };
     const mgr = SessionManager.create(store, rnd.bytes, cfg).unwrap();
     const made = mgr.login(testRequest(Get, "/"), 0, "ann", [], []).unwrap();
     match (mgr.lookup(withCookie(made.id), 30000)) {
-      SessionActive(r, c) => assertEq(r.idleExpiresAt, 100000, "within the touch interval: not rewritten"),
+      SessionActive(r, c) => assertEq(
+        r.idleExpiresAt,
+        100000,
+        "within the touch interval: not rewritten",
+      ),
       _ => fail("active"),
     }
     match (mgr.lookup(withCookie(made.id), 61000)) {
@@ -244,13 +294,28 @@ function absoluteTimeoutNeverSlides(): void {
   scope(s => {
     const store = MemorySessionStore.start(s);
     const rnd = countingRandom(s);
-    const cfg = SessionConfig { ...defaultSessionConfig(), idleTimeoutSeconds: 100, absoluteTimeoutSeconds: 250, touchIntervalSeconds: 0 };
+    const cfg = SessionConfig {
+      ...defaultSessionConfig(),
+      idleTimeoutSeconds: 100,
+      absoluteTimeoutSeconds: 250,
+      touchIntervalSeconds: 0,
+    };
     const mgr = SessionManager.create(store, rnd.bytes, cfg).unwrap();
     const made = mgr.login(testRequest(Get, "/"), 0, "ann", [], []).unwrap();
-    match (mgr.lookup(withCookie(made.id), 90000)) { SessionActive(r, c) => {}, _ => fail("t=90") }
-    match (mgr.lookup(withCookie(made.id), 180000)) { SessionActive(r, c) => {}, _ => fail("t=180") }
+    match (mgr.lookup(withCookie(made.id), 90000)) {
+      SessionActive(r, c) => {},
+      _ => fail("t=90"),
+    }
+    match (mgr.lookup(withCookie(made.id), 180000)) {
+      SessionActive(r, c) => {},
+      _ => fail("t=180"),
+    }
     match (mgr.lookup(withCookie(made.id), 240000)) {
-      SessionActive(r, c) => assertEq(r.idleExpiresAt, 250000, "the idle expiry is capped by the absolute one"),
+      SessionActive(r, c) => assertEq(
+        r.idleExpiresAt,
+        250000,
+        "the idle expiry is capped by the absolute one",
+      ),
       _ => fail("t=240"),
     }
     match (mgr.lookup(withCookie(made.id), 250000)) {
@@ -267,7 +332,13 @@ function persistentCookiesAreReissuedWhenSlid(): void {
   scope(s => {
     const store = MemorySessionStore.start(s);
     const rnd = countingRandom(s);
-    const cfg = SessionConfig { ...defaultSessionConfig(), persistent: true, idleTimeoutSeconds: 100, absoluteTimeoutSeconds: 1000, touchIntervalSeconds: 10 };
+    const cfg = SessionConfig {
+      ...defaultSessionConfig(),
+      persistent: true,
+      idleTimeoutSeconds: 100,
+      absoluteTimeoutSeconds: 1000,
+      touchIntervalSeconds: 10,
+    };
     const mgr = SessionManager.create(store, rnd.bytes, cfg).unwrap();
     const made = mgr.login(testRequest(Get, "/"), 0, "ann", [], []).unwrap();
     match (mgr.lookup(withCookie(made.id), 50000)) {
@@ -296,7 +367,10 @@ function logoutRemovesTheSessionAndClearsTheCookie(): void {
       SessionAnonymous => {},
       _ => fail("the session is gone on the server, a stolen cookie is useless"),
     }
-    assert(mgr.logout(testRequest(Get, "/")).isOk(), "logout without a session still clears the cookie");
+    assert(
+      mgr.logout(testRequest(Get, "/")).isOk(),
+      "logout without a session still clears the cookie",
+    );
     rnd.stop();
     store.close();
   });
@@ -312,9 +386,18 @@ function logoutSubjectEndsEverySessionOfAUser(): void {
     const a2 = mgr.login(testRequest(Get, "/"), 0, "ann", [], []).unwrap();
     const b1 = mgr.login(testRequest(Get, "/"), 0, "bob", [], []).unwrap();
     assertEq(mgr.logoutSubject("ann"), 2, "two removed");
-    match (mgr.lookup(withCookie(a1.id), 1)) { SessionAnonymous => {}, _ => fail("a1") }
-    match (mgr.lookup(withCookie(a2.id), 1)) { SessionAnonymous => {}, _ => fail("a2") }
-    match (mgr.lookup(withCookie(b1.id), 1)) { SessionActive(r, c) => {}, _ => fail("bob keeps his") }
+    match (mgr.lookup(withCookie(a1.id), 1)) {
+      SessionAnonymous => {},
+      _ => fail("a1"),
+    }
+    match (mgr.lookup(withCookie(a2.id), 1)) {
+      SessionAnonymous => {},
+      _ => fail("a2"),
+    }
+    match (mgr.lookup(withCookie(b1.id), 1)) {
+      SessionActive(r, c) => {},
+      _ => fail("bob keeps his"),
+    }
     rnd.stop();
     store.close();
   });

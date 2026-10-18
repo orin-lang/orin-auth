@@ -12,7 +12,9 @@
 //                             JSON otherwise. One setting for an app with pages and an API.
 import { PercentSpace, percentEncode } from "std:url";
 import { Method, Get, Head, toLowerAscii, methodName } from "std:http";
-import { Request, Response, WebError, Handler, Middleware, unauthorized, forbidden, withErrorHeader } from "orin-web";
+import {
+  Request, Response, WebError, Handler, Middleware, unauthorized, forbidden, withErrorHeader,
+} from "orin-web";
 import { Principal, principalOf, hasRole, hasScope, hasAnyRole, hasAllScopes } from "./principal";
 
 export type DenyMode = DenyJson | DenyRedirect(string) | DenyByAccept(string);
@@ -28,19 +30,30 @@ export function defaultAuthzConfig(): AuthzConfig {
 // pagesAuthzConfig(loginUrl): AuthzConfig -- unauthenticated browsers go to `loginUrl?next=..`, a 403 stays a 403. Right for a
 // server-rendered site.
 export function pagesAuthzConfig(loginUrl: string): AuthzConfig {
-  return AuthzConfig { unauthenticated: DenyRedirect(loginUrl), forbidden: DenyJson, challenge: "" };
+  return AuthzConfig {
+    unauthenticated: DenyRedirect(loginUrl),
+    forbidden: DenyJson,
+    challenge: "",
+  };
 }
 
 // mixedAuthzConfig(loginUrl): AuthzConfig -- redirects browsers asking for HTML, answers JSON to everything else.
 export function mixedAuthzConfig(loginUrl: string): AuthzConfig {
-  return AuthzConfig { unauthenticated: DenyByAccept(loginUrl), forbidden: DenyJson, challenge: "Bearer" };
+  return AuthzConfig {
+    unauthenticated: DenyByAccept(loginUrl),
+    forbidden: DenyJson,
+    challenge: "Bearer",
+  };
 }
 
 // safeNext(next, fallback): string -- `next` when it is a same-site path ("/orders?id=3"), else `fallback`. Use it on the `next`
 // parameter of the login page before redirecting after login: an open redirect ("//evil.example", "/\evil.example",
 // "https://evil.example", control characters) is refused.
 export function safeNext(next: string, fallback: string): string {
-  if (next.length == 0 || !next.startsWith("/") || next.startsWith("//") || next.startsWith("/\\")) {
+  if (next.length == 0
+      || !next.startsWith("/")
+      || next.startsWith("//")
+      || next.startsWith("/\\")) {
     return fallback;
   }
   let i: usize = 0;
@@ -67,7 +80,8 @@ function isRead(req: Request): bool {
 function redirectTo(url: string, req: Request, withNext: bool): Result<Response, WebError> {
   let location = url;
   if (withNext && isRead(req)) {
-    location = url + (url.includes("?") ? "&" : "?") + "next=" + percentEncode(req.target(), PercentSpace);
+    location = url + (url.includes("?") ? "&" : "?") + "next="
+        + percentEncode(req.target(), PercentSpace);
   }
   return Response.redirect(303, location);
 }

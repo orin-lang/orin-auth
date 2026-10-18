@@ -35,8 +35,15 @@ export function scopeMiddlewareName(scope: string): string {
 // authMiddlewares(base, cfg, roles, scopes): Middlewares -- `base` plus "authenticated" and "auth" (any principal), "role:<r>" for each
 // role in `roles` and "scope:<s>" for each scope in `scopes`. The denial behaviour (401 / 403 / redirect) is `cfg`. Put
 // `authenticate(..)` in the router with `Router.use` (global middleware), so that it runs before these.
-export function authMiddlewares(base: Middlewares, cfg: AuthzConfig, roles: string[], scopes: string[]): Middlewares {
-  let mws = base.with(AUTHENTICATED, requireAuthenticated(cfg)).with("auth", requireAuthenticated(cfg));
+export function authMiddlewares(
+  base: Middlewares,
+  cfg: AuthzConfig,
+  roles: string[],
+  scopes: string[],
+): Middlewares {
+  let mws = base
+      .with(AUTHENTICATED, requireAuthenticated(cfg))
+      .with("auth", requireAuthenticated(cfg));
   for (const r of roles) {
     mws = mws.with(roleMiddlewareName(r), requireRole(cfg, r));
   }

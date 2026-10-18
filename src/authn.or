@@ -12,14 +12,19 @@
 // and passes the request on. It does NOT require authentication: anonymous requests go through, and `requireAuthenticated` /
 // `requireRole` / `requireScope` (authz.or) decide. The wall clock is read once per request and given to every authenticator.
 import { QueryPair } from "std:url";
-import { Request, Response, WebError, Handler, Middleware, unauthorized, withErrorHeader } from "orin-web";
+import {
+  Request, Response, WebError, Handler, Middleware, unauthorized, withErrorHeader,
+} from "orin-web";
 import { NowFn } from "./services";
 import { Principal, ViaSession, withPrincipal, withoutPrincipal } from "./principal";
 import { SessionManager, SessionActive, SessionAnonymous, SessionExpired } from "./session";
 
 export type AuthExtras = { attrs: QueryPair[]; setCookies: string[]; };
 
-export type AuthOutcome = AuthAnonymous | AuthPassed(Principal, AuthExtras) | AuthFailed(string, string);
+export type AuthOutcome =
+  AuthAnonymous
+  | AuthPassed(Principal, AuthExtras)
+  | AuthFailed(string, string);
 
 export type Authenticator = (req: Request, now: int) => AuthOutcome;
 
@@ -44,7 +49,12 @@ export function sessionAuthenticator(manager: SessionManager): Authenticator {
       SessionAnonymous => AuthAnonymous,
       SessionExpired => AuthAnonymous,
       SessionActive(rec, renewed) => {
-        const p = Principal { subject: rec.subject, roles: rec.roles, scopes: rec.scopes, method: ViaSession };
+        const p = Principal {
+          subject: rec.subject,
+          roles: rec.roles,
+          scopes: rec.scopes,
+          method: ViaSession,
+        };
         const extras = AuthExtras {
           attrs: [QueryPair { key: SESSION_ATTR, value: rec.idHash }],
           setCookies: renewed.isSome() ? [renewed.unwrap()] : [],

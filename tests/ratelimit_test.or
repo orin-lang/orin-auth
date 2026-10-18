@@ -1,8 +1,12 @@
 import { assert, assertEq, assertEqString, assertEqBool } from "std:test";
 import { Get, Post } from "std:http";
 import { scope } from "std:task";
-import { Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertHeader } from "orin-web";
-import { RateLimiter, RateLimitConfig, defaultLoginLimit, rateLimit, fixedClock } from "../src/module";
+import {
+  Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertHeader,
+} from "orin-web";
+import {
+  RateLimiter, RateLimitConfig, defaultLoginLimit, rateLimit, fixedClock,
+} from "../src/module";
 
 function cfg(cap: int, every: int): RateLimitConfig {
   return RateLimitConfig { capacity: cap, refillEveryMs: every, maxKeys: 1000 };
@@ -55,12 +59,18 @@ function clockGoingBackwardsDoesNotGiveTokens(): void {
 @Test
 function memoryIsBounded(): void {
   scope(s => {
-    const rl = RateLimiter.start(s, RateLimitConfig { capacity: 2, refillEveryMs: 1000, maxKeys: 3 }).unwrap();
+    const rl = RateLimiter
+        .start(s, RateLimitConfig { capacity: 2, refillEveryMs: 1000, maxKeys: 3 })
+        .unwrap();
     rl.allow("a", 0);
     rl.allow("b", 0);
     rl.allow("c", 0);
     assertEq(rl.size(), 3, "full");
-    assertEqBool(rl.allow("d", 0).allowed, false, "a new key is refused while the table is full of active buckets");
+    assertEqBool(
+      rl.allow("d", 0).allowed,
+      false,
+      "a new key is refused while the table is full of active buckets",
+    );
     assertEqBool(rl.allow("a", 0).allowed, true, "known keys keep working");
     assertEqBool(rl.allow("d", 10000).allowed, true, "idle buckets are swept to make room");
     assert(rl.size() <= 3, "still bounded");
@@ -84,11 +94,13 @@ function middlewareAnswers429WithRetryAfter(): void {
   scope(s => {
     const rl = RateLimiter.start(s, cfg(2, 30000)).unwrap();
     let app = new Router();
-    app.use(rateLimit(
-      rl,
-      (req: Request): Option<string> => req.path() == "/login" ? req.header("x-user") : None,
-      fixedClock(0),
-    ));
+    app.use(
+      rateLimit(
+        rl,
+        (req: Request): Option<string> => req.path() == "/login" ? req.header("x-user") : None,
+        fixedClock(0),
+      ),
+    );
     app.post("/login", (req: Request): Result<Response, WebError> => Ok(Response.text(200, "ok")));
     app.get("/other", (req: Request): Result<Response, WebError> => Ok(Response.text(200, "ok")));
     const c = new TestClient(app).withHeader("X-User", "ann");
@@ -97,7 +109,10 @@ function middlewareAnswers429WithRetryAfter(): void {
     const limited = c.send(testRequest(Post, "/login"));
     assertStatus(limited, 429);
     assertHeader(limited, "Retry-After", "30");
-    assertStatus(new TestClient(app).withHeader("X-User", "bob").send(testRequest(Post, "/login")), 200);
+    assertStatus(
+      new TestClient(app).withHeader("X-User", "bob").send(testRequest(Post, "/login")),
+      200,
+    );
     assertStatus(new TestClient(app).send(testRequest(Post, "/login")), 200);
     for (const i of [1, 2, 3, 4]) {
       assertStatus(c.get("/other"), 200);

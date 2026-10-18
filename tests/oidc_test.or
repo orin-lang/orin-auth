@@ -1,0 +1,676 @@
+import { assert, assertEq, assertEqString, assertEqBool, fail } from "std:test";
+import { Bytes, fromString } from "std:bytes";
+import {
+  JsonValue, JsonMember, ValueString, ValueNumber, ValueObject, writeDocument, defaultLimits,
+} from "std:json";
+import { numberFromInt } from "std:json/number";
+import { QueryPair, parseQuery, PercentSpace, percentDecode } from "std:url";
+import { scope } from "std:task";
+import * as encoding from "std:encoding";
+import {
+  OidcProvider, OidcClient, OidcHttp, OidcHttpRequest, OidcHttpResponse, OidcError, OidcErrorKind,
+  OidcDiscoveryInvalid, OidcStateInvalid, OidcProviderError, OidcTokenExchange, OidcTokenInvalid,
+  OidcNonceMismatch, MemoryOidcTxnStore, LoginStart, parseDiscovery, discoveryUrl, parseJwks,
+  jwksKeys, pkceChallenge, beginLogin, completeLogin, tokenRequest, jwtIdTokenValidator,
+  fetchProvider, fetchJwks, OidcIdentity, IdTokenValidator, defaultCookieAttrs, countingRandom,
+  failingRandom, jwtSecret, signJwt, jwtClaims, defaultJwtOptions, JwtOptions, JwtKey, JwtRS256,
+  SignatureVerifier,
+} from "../src/module";
+import { AuthError } from "../src/module";
+
+const ISSUER: string = "https://idp.example";
+const SECRET: string = "0123456789abcdef0123456789abcdef";
+const NOW: int = 1700000000000;
+
+function provider(): OidcProvider {
+  return OidcProvider {
+    issuer: ISSUER,
+    authorizationEndpoint: "https://idp.example/authorize",
+    tokenEndpoint: "https://idp.example/token",
+    jwksUri: "https://idp.example/jwks",
+  };
+}
+
+function client(secret: Option<string>): OidcClient {
+  return OidcClient {
+    clientId: "my-app",
+    clientSecret: secret,
+    redirectUri: "https://app.example/callback",
+    scopes: ["profile", "email"],
+  };
+}
+
+function hsKey(): JwtKey {
+  return jwtSecret(None, fromString(SECRET)).unwrap();
+}
+
+function validator(): IdTokenValidator {
+  return jwtIdTokenValidator([hsKey()], defaultJwtOptions());
+}
+
+function discoveryDoc(tokenEndpoint: string): string {
+  return "{\"issuer\":\"https://idp.example\",\"authorization_endpoint\":\"https://idp.example/authorize\",\"token_endpoint\":\""
+      + tokenEndpoint + "\",\"jwks_uri\":\"https://idp.example/jwks\",\"extra\":1}";
+}
+
+function queryOf(url: string): QueryPair[] {
+  const q = url.indexOf("?");
+  return parseQuery(url.substring(q.unwrap() + 1, url.length), PercentSpace).unwrap();
+}
+
+function get(ps: QueryPair[], k: string): string {
+  for (const p of ps) {
+    if (p.key == k) {
+      return p.value;
+    }
+  }
+  return "";
+}
+
+function cookieValue(setCookie: string): string {
+  return setCookie.split(";")[0].split("=")[1];
+}
+
+function idToken(sub: string, aud: string, iss: string, nonce: string, exp: int): string {
+  const claims = jwtClaims(
+    sub,
+    iss,
+    aud,
+    1699999000,
+    exp,
+    [JsonMember { key: "nonce", value: ValueString(nonce) }],
+  );
+  return signJwt(hsKey(), claims).unwrap();
+}
+
+function tokenResponse(id: string): OidcHttpResponse {
+  const body = writeDocument(
+    ValueObject([
+      JsonMember { key: "id_token", value: ValueString(id) },
+      JsonMember { key: "access_token", value: ValueString("at-123") },
+      JsonMember { key: "token_type", value: ValueString("Bearer") },
+    ]),
+    defaultLimits(),
+  ).unwrap();
+  return OidcHttpResponse { status: 200, body: body };
+}
+
+function never(): OidcHttp {
+  return (r: OidcHttpRequest): Result<OidcHttpResponse, string> => {
+    fail("the token endpoint must not be called");
+    return Err("unreachable");
+  };
+}
+
+// What a test varies in the flow.
+type Variation = {
+  tokenIss: string;
+  tokenAud: string;
+  tokenNonce: Option<string>; // None = the nonce that was sent
+  tokenExp: int;
+  tokenStatus: int;
+  omitIdToken: bool;
+  cookie: Option<string>; // None = the cookie that was set
+  stateParam: Option<string>; // None = the state that was sent
+  extraParams: QueryPair[];
+  callbackAt: int;
+};
+
+function normal(): Variation {
+  return Variation {
+    tokenIss: ISSUER,
+    tokenAud: "my-app",
+    tokenNonce: None,
+    tokenExp: 1700003600,
+    tokenStatus: 200,
+    omitIdToken: false,
+    cookie: None,
+    stateParam: None,
+    extraParams: [],
+    callbackAt: NOW + 5000,
+  };
+}
+
+function flow(
+  store: MemoryOidcTxnStore,
+  rnd: (n: usize) => Result<Bytes, AuthError>,
+  v: Variation,
+  secret: Option<string>,
+): Result<OidcIdentity, OidcError> {
+  const start = beginLogin(
+    provider(),
+    client(secret),
+    store,
+    rnd,
+    "oidc",
+    defaultCookieAttrs(),
+    NOW,
+    "/dashboard",
+  ).unwrap();
+  const q = queryOf(start.url);
+  const state = get(q, "state");
+  const nonce = get(q, "nonce");
+  const challenge = get(q, "code_challenge");
+  const id = idToken(
+    "user-42",
+    v.tokenAud,
+    v.tokenIss,
+    v.tokenNonce.isSome() ? v.tokenNonce.unwrap() : nonce,
+    v.tokenExp,
+  );
+  const http = (r: OidcHttpRequest): Result<OidcHttpResponse, string> => {
+    // the provider checks PKCE: SHA-256 of the verifier must be the challenge from the redirect
+    const body = parseQuery(r.body, PercentSpace).unwrap();
+    assertEqString(
+      pkceChallenge(get(body, "code_verifier")),
+      challenge,
+      "the token request proves possession of the verifier",
+    );
+    assertEqString(get(body, "code"), "auth-code-1", "code");
+    if (v.tokenStatus != 200) {
+      return Ok(OidcHttpResponse { status: v.tokenStatus, body: "{\"error\":\"invalid_grant\"}" });
+    }
+    if (v.omitIdToken) {
+      return Ok(OidcHttpResponse { status: 200, body: "{\"access_token\":\"x\"}" });
+    }
+    return Ok(tokenResponse(id));
+  };
+  let params = [
+    QueryPair { key: "code", value: "auth-code-1" },
+    QueryPair { key: "state", value: v.stateParam.isSome() ? v.stateParam.unwrap() : state },
+  ];
+  for (const p of v.extraParams) {
+    params.push(p);
+  }
+  const cookie = v.cookie.isSome() ? v.cookie : Some(cookieValue(start.setCookie));
+  return completeLogin(
+    provider(),
+    client(secret),
+    store,
+    http,
+    validator(),
+    cookie,
+    params,
+    v.callbackAt,
+  );
+}
+
+function failsWith(r: Result<OidcIdentity, OidcError>, kind: OidcErrorKind, what: string): void {
+  assert(r.isErr(), what + ": refused");
+  assertEqBool(r.unwrapErr().kind == kind, true, what + ": kind");
+}
+
+@Test
+function beginLoginBuildsASafeAuthorizationRequest(): void {
+  scope(s => {
+    const store = MemoryOidcTxnStore.start(s);
+    const rnd = countingRandom(s);
+    const start = beginLogin(
+      provider(),
+      client(None),
+      store,
+      rnd.bytes,
+      "oidc",
+      defaultCookieAttrs(),
+      NOW,
+      "/dashboard",
+    ).unwrap();
+    assert(start.url.startsWith("https://idp.example/authorize?"), "authorization endpoint");
+    const q = queryOf(start.url);
+    assertEqString(get(q, "response_type"), "code", "code flow");
+    assertEqString(get(q, "client_id"), "my-app", "client");
+    assertEqString(get(q, "redirect_uri"), "https://app.example/callback", "redirect uri, decoded");
+    assertEqString(get(q, "scope"), "openid profile email", "openid is always requested");
+    assertEqString(get(q, "code_challenge_method"), "S256", "S256, never plain");
+    assertEq(get(q, "state").length.toInt(), 43, "256-bit state");
+    assertEq(get(q, "nonce").length.toInt(), 43, "256-bit nonce");
+    assertEq(get(q, "code_challenge").length.toInt(), 43, "challenge is a SHA-256");
+    assert(get(q, "state") != get(q, "nonce"), "distinct values");
+    assert(start.setCookie.startsWith("oidc="), "binding cookie");
+    assert(
+      start.setCookie.includes("HttpOnly")
+          && start.setCookie.includes("Secure")
+          && start.setCookie.includes("SameSite=Lax"),
+      "cookie attributes",
+    );
+    assert(start.setCookie.includes("Max-Age=600"), "short lived");
+    assertEq(store.size(), 1, "one transaction");
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function theHappyPath(): void {
+  scope(s => {
+    const store = MemoryOidcTxnStore.start(s);
+    const rnd = countingRandom(s);
+    const id = flow(store, rnd.bytes, normal(), None).unwrap();
+    assertEqString(id.subject, "user-42", "subject");
+    assertEqString(id.issuer, ISSUER, "issuer");
+    assertEqString(id.returnTo, "/dashboard", "return to");
+    assertEqString(id.accessToken.unwrap(), "at-123", "access token");
+    assertEq(store.size(), 0, "the transaction is spent");
+    // a confidential client works the same way
+    assert(flow(store, rnd.bytes, normal(), Some("s3cret")).isOk(), "confidential client");
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function stateIsSingleUseAndBoundToTheBrowser(): void {
+  scope(s => {
+    const store = MemoryOidcTxnStore.start(s);
+    const rnd = countingRandom(s);
+    failsWith(
+      flow(store, rnd.bytes, Variation { ...normal(), stateParam: Some("forged-state") }, None),
+      OidcStateInvalid,
+      "unknown state",
+    );
+    failsWith(
+      flow(store, rnd.bytes, Variation { ...normal(), cookie: Some("someone-elses-cookie") }, None),
+      OidcStateInvalid,
+      "another browser (login CSRF)",
+    );
+    failsWith(
+      flow(store, rnd.bytes, Variation { ...normal(), cookie: Some("") }, None),
+      OidcStateInvalid,
+      "empty cookie",
+    );
+    // no cookie at all
+    const start = beginLogin(
+      provider(),
+      client(None),
+      store,
+      rnd.bytes,
+      "oidc",
+      defaultCookieAttrs(),
+      NOW,
+      "/",
+    ).unwrap();
+    const st = get(queryOf(start.url), "state");
+    failsWith(
+      completeLogin(
+        provider(),
+        client(None),
+        store,
+        never(),
+        validator(),
+        None,
+        [QueryPair { key: "code", value: "c" }, QueryPair { key: "state", value: st }],
+        NOW + 1,
+      ),
+      OidcStateInvalid,
+      "no cookie",
+    );
+    // that attempt spent the transaction: a replay with the right cookie fails
+    failsWith(
+      completeLogin(
+        provider(),
+        client(None),
+        store,
+        never(),
+        validator(),
+        Some(cookieValue(start.setCookie)),
+        [QueryPair { key: "code", value: "c" }, QueryPair { key: "state", value: st }],
+        NOW + 2,
+      ),
+      OidcStateInvalid,
+      "replay after a failed attempt",
+    );
+    failsWith(
+      completeLogin(
+        provider(),
+        client(None),
+        store,
+        never(),
+        validator(),
+        None,
+        [QueryPair { key: "code", value: "c" }],
+        NOW,
+      ),
+      OidcStateInvalid,
+      "no state",
+    );
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function aSuccessfulCallbackCannotBeReplayed(): void {
+  scope(s => {
+    const store = MemoryOidcTxnStore.start(s);
+    const rnd = countingRandom(s);
+    const start = beginLogin(
+      provider(),
+      client(None),
+      store,
+      rnd.bytes,
+      "oidc",
+      defaultCookieAttrs(),
+      NOW,
+      "/",
+    ).unwrap();
+    const q = queryOf(start.url);
+    const id = idToken("u", "my-app", ISSUER, get(q, "nonce"), 1700003600);
+    const http = (r: OidcHttpRequest): Result<OidcHttpResponse, string> => Ok(tokenResponse(id));
+    const params = [
+      QueryPair { key: "code", value: "c" },
+      QueryPair { key: "state", value: get(q, "state") },
+    ];
+    const cookie = Some(cookieValue(start.setCookie));
+    assert(
+      completeLogin(
+        provider(),
+        client(None),
+        store,
+        http,
+        validator(),
+        cookie,
+        params,
+        NOW + 10,
+      ).isOk(),
+      "first",
+    );
+    failsWith(
+      completeLogin(provider(), client(None), store, http, validator(), cookie, params, NOW + 20),
+      OidcStateInvalid,
+      "second",
+    );
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function expiredTransactionsAreRefused(): void {
+  scope(s => {
+    const store = MemoryOidcTxnStore.start(s);
+    const rnd = countingRandom(s);
+    failsWith(
+      flow(store, rnd.bytes, Variation { ...normal(), callbackAt: NOW + 601000 }, None),
+      OidcStateInvalid,
+      "after ten minutes",
+    );
+    assert(
+      flow(store, rnd.bytes, Variation { ...normal(), callbackAt: NOW + 599000 }, None).isOk(),
+      "just in time",
+    );
+    start2(store, rnd.bytes);
+    assertEq(store.sweep(NOW + 700000), 1, "abandoned logins are swept");
+    rnd.stop();
+    store.close();
+  });
+}
+
+function start2(store: MemoryOidcTxnStore, rnd: (n: usize) => Result<Bytes, AuthError>): void {
+  beginLogin(provider(), client(None), store, rnd, "oidc", defaultCookieAttrs(), NOW, "/").unwrap();
+}
+
+@Test
+function providerErrorsAreReportedAndSpendTheTransaction(): void {
+  scope(s => {
+    const store = MemoryOidcTxnStore.start(s);
+    const rnd = countingRandom(s);
+    const start = beginLogin(
+      provider(),
+      client(None),
+      store,
+      rnd.bytes,
+      "oidc",
+      defaultCookieAttrs(),
+      NOW,
+      "/",
+    ).unwrap();
+    const st = get(queryOf(start.url), "state");
+    const r = completeLogin(
+      provider(),
+      client(None),
+      store,
+      never(),
+      validator(),
+      Some(cookieValue(start.setCookie)),
+      [QueryPair { key: "error", value: "access_denied" }, QueryPair { key: "state", value: st }],
+      NOW + 1,
+    );
+    failsWith(r, OidcProviderError, "access_denied");
+    assertEq(store.size(), 0, "spent");
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function idTokenChecks(): void {
+  scope(s => {
+    const store = MemoryOidcTxnStore.start(s);
+    const rnd = countingRandom(s);
+    failsWith(
+      flow(store, rnd.bytes, Variation { ...normal(), tokenNonce: Some("replayed-nonce") }, None),
+      OidcNonceMismatch,
+      "wrong nonce",
+    );
+    failsWith(
+      flow(store, rnd.bytes, Variation { ...normal(), tokenIss: "https://evil.example" }, None),
+      OidcTokenInvalid,
+      "wrong issuer",
+    );
+    failsWith(
+      flow(store, rnd.bytes, Variation { ...normal(), tokenAud: "another-app" }, None),
+      OidcTokenInvalid,
+      "wrong audience",
+    );
+    failsWith(
+      flow(store, rnd.bytes, Variation { ...normal(), tokenExp: 1699990000 }, None),
+      OidcTokenInvalid,
+      "expired id token",
+    );
+    failsWith(
+      flow(store, rnd.bytes, Variation { ...normal(), tokenStatus: 400 }, None),
+      OidcTokenExchange,
+      "token endpoint refuses",
+    );
+    failsWith(
+      flow(store, rnd.bytes, Variation { ...normal(), omitIdToken: true }, None),
+      OidcTokenExchange,
+      "no id_token",
+    );
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function signatureAndAlgorithmAreChecked(): void {
+  scope(s => {
+    const store = MemoryOidcTxnStore.start(s);
+    const rnd = countingRandom(s);
+    const start = beginLogin(
+      provider(),
+      client(None),
+      store,
+      rnd.bytes,
+      "oidc",
+      defaultCookieAttrs(),
+      NOW,
+      "/",
+    ).unwrap();
+    const q = queryOf(start.url);
+    const good = idToken("u", "my-app", ISSUER, get(q, "nonce"), 1700003600);
+    const parts = good.split(".");
+    // alg none, a forged payload under the old signature
+    const none = "eyJhbGciOiJub25lIn0." + parts[1] + ".";
+    const forged = parts[0] + ".eyJzdWIiOiJhZG1pbiJ9." + parts[2];
+    const params = [
+      QueryPair { key: "code", value: "c" },
+      QueryPair { key: "state", value: get(q, "state") },
+    ];
+    const cookie = Some(cookieValue(start.setCookie));
+    const answer = (t: string): OidcHttp => (r: OidcHttpRequest): Result<OidcHttpResponse, string> => Ok(
+      tokenResponse(t),
+    );
+    failsWith(
+      completeLogin(
+        provider(),
+        client(None),
+        store,
+        answer(none),
+        validator(),
+        cookie,
+        params,
+        NOW + 1,
+      ),
+      OidcTokenInvalid,
+      "alg none",
+    );
+    // each attempt spends the transaction: begin again for the second
+    const start2 = beginLogin(
+      provider(),
+      client(None),
+      store,
+      rnd.bytes,
+      "oidc",
+      defaultCookieAttrs(),
+      NOW,
+      "/",
+    ).unwrap();
+    const q2 = queryOf(start2.url);
+    const params2 = [
+      QueryPair { key: "code", value: "c" },
+      QueryPair { key: "state", value: get(q2, "state") },
+    ];
+    failsWith(
+      completeLogin(
+        provider(),
+        client(None),
+        store,
+        answer(forged),
+        validator(),
+        Some(cookieValue(start2.setCookie)),
+        params2,
+        NOW + 1,
+      ),
+      OidcTokenInvalid,
+      "forged payload",
+    );
+    rnd.stop();
+    store.close();
+  });
+}
+
+@Test
+function rs256ThroughAnExternalVerifierKey(): void {
+  // The provider signs with RS256; the application (or std:crypto) supplies the RSA check. Here the "verifier" accepts one
+  // signature, which is enough to show that the surrounding checks (nonce, iss, aud) run on top of it.
+  scope(s => {
+    const store = MemoryOidcTxnStore.start(s);
+    const rnd = countingRandom(s);
+    const jwks = parseJwks(
+      "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"r1\",\"alg\":\"RS256\",\"n\":\"AQAB\",\"e\":\"AQAB\"}]}",
+    ).unwrap();
+    const keys = jwksKeys(
+      jwks,
+      (n: Bytes, e: Bytes): Option<SignatureVerifier> => Some(
+        (i: Bytes, sig: Bytes): bool => sig.equals(fromString("rsa-signature")),
+      ),
+    );
+    const start = beginLogin(
+      provider(),
+      client(None),
+      store,
+      rnd.bytes,
+      "oidc",
+      defaultCookieAttrs(),
+      NOW,
+      "/",
+    ).unwrap();
+    const q = queryOf(start.url);
+    const header = "eyJhbGciOiJSUzI1NiIsImtpZCI6InIxIn0";
+    const claims = jwtClaims(
+      "rsa-user",
+      ISSUER,
+      "my-app",
+      1699999000,
+      1700003600,
+      [JsonMember { key: "nonce", value: ValueString(get(q, "nonce")) }],
+    );
+    const payload = payloadB64(claims);
+    const token = header + "." + payload + ".cnNhLXNpZ25hdHVyZQ";
+    const http = (r: OidcHttpRequest): Result<OidcHttpResponse, string> => Ok(tokenResponse(token));
+    const v = jwtIdTokenValidator(
+      keys,
+      JwtOptions { ...defaultJwtOptions(), algorithms: [JwtRS256] },
+    );
+    const params = [
+      QueryPair { key: "code", value: "c" },
+      QueryPair { key: "state", value: get(q, "state") },
+    ];
+    const id = completeLogin(
+      provider(),
+      client(None),
+      store,
+      http,
+      v,
+      Some(cookieValue(start.setCookie)),
+      params,
+      NOW + 1,
+    );
+    assertEqString(id.unwrap().subject, "rsa-user", "verified through the external key");
+    rnd.stop();
+    store.close();
+  });
+}
+
+function payloadB64(claims: JsonValue): string {
+  const text = writeDocument(claims, defaultLimits()).unwrap();
+  return encoding.base64UrlEncode(fromString(text), encoding.Unpadded);
+}
+
+@Test
+function noEntropyNoLogin(): void {
+  scope(s => {
+    const store = MemoryOidcTxnStore.start(s);
+    assert(
+      beginLogin(
+        provider(),
+        client(None),
+        store,
+        failingRandom(),
+        "oidc",
+        defaultCookieAttrs(),
+        NOW,
+        "/",
+      ).isErr(),
+      "refused",
+    );
+    assertEq(store.size(), 0, "nothing stored");
+    store.close();
+  });
+}
+
+@Test
+function discoveryAndJwksThroughThePluggableHttp(): void {
+  const http = (r: OidcHttpRequest): Result<OidcHttpResponse, string> => {
+    if (r.url == "https://idp.example/.well-known/openid-configuration") {
+      return Ok(OidcHttpResponse { status: 200, body: discoveryDoc("https://idp.example/token") });
+    }
+    if (r.url == "https://idp.example/jwks") {
+      return Ok(OidcHttpResponse { status: 200, body: "{\"keys\":[]}" });
+    }
+    return Ok(OidcHttpResponse { status: 404, body: "" });
+  };
+  const p = fetchProvider(http, ISSUER, false).unwrap();
+  assertEqString(p.jwksUri, "https://idp.example/jwks", "provider");
+  assertEq(fetchJwks(http, p).unwrap().length.toInt(), 0, "empty set");
+  assert(fetchProvider(http, "https://nowhere.example", false).isErr(), "404");
+  assert(
+    fetchProvider(
+      (r: OidcHttpRequest): Result<OidcHttpResponse, string> => Err("network"),
+      ISSUER,
+      false,
+    ).isErr(),
+    "network failure",
+  );
+}

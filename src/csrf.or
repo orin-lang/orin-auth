@@ -26,7 +26,9 @@ import { methodName, isToken, toLowerAscii } from "std:http";
 import { Request, Response, WebError, Handler, Middleware, forbidden } from "orin-web";
 import { AuthError, authError, ConfigInvalid, InputInvalid } from "./error";
 import { RandomFn } from "./services";
-import { CookieAttrs, defaultCookieAttrs, checkCookie, setCookieValue, requestCookie } from "./cookie";
+import {
+  CookieAttrs, defaultCookieAttrs, checkCookie, setCookieValue, requestCookie,
+} from "./cookie";
 import { sessionIdHashOf } from "./authn";
 import {
   hmacSha256, constantTimeEquals, base64UrlEncode, base64UrlDecode, textToBytes,
@@ -91,7 +93,8 @@ function originOfUrl(u: string): string {
   }
   const rest = u.substring(sep.unwrap() + 3, u.length);
   const slash = rest.indexOf("/");
-  return u.substring(0, sep.unwrap() + 3) + (slash.isSome() ? rest.substring(0, slash.unwrap()) : rest);
+  return u.substring(0, sep.unwrap() + 3)
+      + (slash.isSome() ? rest.substring(0, slash.unwrap()) : rest);
 }
 
 export class CsrfProtection {
@@ -117,7 +120,9 @@ export class CsrfProtection {
     match (cfg.mode) {
       CsrfHeaderMode(name) => {
         if (!isToken(name)) {
-          return Err(authError(ConfigInvalid, "the required header name is not a valid header name"));
+          return Err(
+            authError(ConfigInvalid, "the required header name is not a valid header name"),
+          );
         }
       },
       CsrfTokenMode => {},
@@ -149,7 +154,12 @@ export class CsrfProtection {
   token(req: Request): Result<string, AuthError> {
     const b = this.bindingOf(req);
     if (b.isNone()) {
-      return Err(authError(InputInvalid, "no CSRF binding: the csrfProtection middleware has not run for this request"));
+      return Err(
+        authError(
+          InputInvalid,
+          "no CSRF binding: the csrfProtection middleware has not run for this request",
+        ),
+      );
     }
     const nonce = this.random(NONCE_BYTES)?;
     return Ok(base64UrlEncode(nonce.concat(this.mac(b.unwrap(), nonce))));
@@ -233,7 +243,8 @@ export class CsrfProtection {
       if (isSafeMethod(method)) {
         return this.safe(req, next);
       }
-      if ((this.cfg.exemptAuthorization && req.header("authorization").isSome()) || this.cfg.skip(req)) {
+      if (this.cfg.exemptAuthorization && req.header("authorization").isSome()
+          || this.cfg.skip(req)) {
         return next(req);
       }
       const origin = this.originOk(req);
@@ -242,7 +253,9 @@ export class CsrfProtection {
       }
       // the binding cookie, if any (a session binds through the authenticator's attribute)
       const cookie = requestCookie(req, this.cfg.cookieName);
-      const bound = cookie.isSome() && cookie.unwrap().length > 0 ? req.withAttr(BINDING_ATTR, cookie.unwrap()) : req;
+      const bound = cookie.isSome() && cookie.unwrap().length > 0
+          ? req.withAttr(BINDING_ATTR, cookie.unwrap())
+          : req;
       match (this.cfg.mode) {
         CsrfHeaderMode(name) => {
           const v = req.header(name);

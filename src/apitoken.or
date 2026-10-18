@@ -16,7 +16,9 @@ import { Request } from "orin-web";
 import { AuthError, authError, ConfigInvalid, InputInvalid, ServiceUnavailable } from "./error";
 import { RandomFn } from "./services";
 import { Principal, ViaApiToken } from "./principal";
-import { AuthOutcome, AuthAnonymous, AuthPassed, AuthFailed, Authenticator, noExtras } from "./authn";
+import {
+  AuthOutcome, AuthAnonymous, AuthPassed, AuthFailed, Authenticator, noExtras,
+} from "./authn";
 import {
   sha256, hexEncode, hexDecode, base64UrlEncode, constantTimeEquals, textToBytes,
 } from "./internal/crypto";
@@ -101,7 +103,7 @@ export function isValidTokenPrefix(p: string): bool {
   let i: usize = 0;
   while (i < p.length) {
     const c = p.charCodeAt(i).toInt();
-    if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57))) {
+    if (!(c >= 97 && c <= 122 || c >= 48 && c <= 57)) {
       return false;
     }
     i += 1;
@@ -113,7 +115,7 @@ function isUnreservedToken(s: string): bool {
   let i: usize = 0;
   while (i < s.length) {
     const c = s.charCodeAt(i).toInt();
-    if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 95)) {
+    if (!(c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 45 || c == 95)) {
       return false;
     }
     i += 1;
@@ -142,12 +144,16 @@ export function issueApiToken(
   }
   for (const r of spec.roles) {
     if (!nameOk(r)) {
-      return Err(authError(InputInvalid, "role names must be non-empty and have no space, comma or |"));
+      return Err(
+        authError(InputInvalid, "role names must be non-empty and have no space, comma or |"),
+      );
     }
   }
   for (const sc of spec.scopes) {
     if (!nameOk(sc)) {
-      return Err(authError(InputInvalid, "scope names must be non-empty and have no space, comma or |"));
+      return Err(
+        authError(InputInvalid, "scope names must be non-empty and have no space, comma or |"),
+      );
     }
   }
   if (spec.expiresAt.isSome() && spec.expiresAt.unwrap() <= now) {
@@ -174,7 +180,12 @@ export function issueApiToken(
   return Ok(IssuedToken { token: prefix + "_" + id + "_" + secret, record: rec });
 }
 
-export type TokenFailure = TokenMalformed | TokenUnknown | TokenWrongSecret | TokenExpired | TokenRevoked;
+export type TokenFailure =
+  TokenMalformed
+  | TokenUnknown
+  | TokenWrongSecret
+  | TokenExpired
+  | TokenRevoked;
 
 export type TokenCheck = TokenValid(ApiTokenRecord) | TokenInvalid(TokenFailure);
 
@@ -206,7 +217,12 @@ export function splitToken(prefix: string, token: string): Option<string[]> {
 
 // verifyApiToken(store, prefix, token, now): TokenCheck -- see the module comment. The expiry and revocation are checked AFTER the
 // secret, so only the holder of a real token learns that it is expired or revoked.
-export function verifyApiToken(store: ApiTokenStore, prefix: string, token: string, now: int): TokenCheck {
+export function verifyApiToken(
+  store: ApiTokenStore,
+  prefix: string,
+  token: string,
+  now: int,
+): TokenCheck {
   const parts = splitToken(prefix, token);
   if (parts.isNone()) {
     return TokenInvalid(TokenMalformed);
@@ -254,7 +270,12 @@ export function apiTokenAuthenticator(store: ApiTokenStore, prefix: string): Aut
     }
     return match (verifyApiToken(store, prefix, bearer.unwrap(), now)) {
       TokenValid(rec) => AuthPassed(
-        Principal { subject: rec.subject, roles: rec.roles, scopes: rec.scopes, method: ViaApiToken },
+        Principal {
+          subject: rec.subject,
+          roles: rec.roles,
+          scopes: rec.scopes,
+          method: ViaApiToken,
+        },
         noExtras(),
       ),
       TokenInvalid(why) => AuthFailed(tokenFailureText(why), "Bearer error=\"invalid_token\""),

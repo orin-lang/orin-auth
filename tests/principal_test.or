@@ -2,8 +2,8 @@ import { assert, assertEq, assertEqString, assertEqBool } from "std:test";
 import { Get } from "std:http";
 import { testRequest } from "orin-web";
 import {
-  Principal, ViaSession, ViaJwt, newPrincipal, hasRole, hasScope, hasAnyRole, hasAllScopes, withPrincipal, withoutPrincipal,
-  principalOf, authMethodName,
+  Principal, ViaSession, ViaJwt, newPrincipal, hasRole, hasScope, hasAnyRole, hasAllScopes,
+  withPrincipal, withoutPrincipal, principalOf, authMethodName,
 } from "../src/module";
 
 @Test
@@ -20,7 +20,9 @@ function principalRoundTripsThroughARequest(): void {
 @Test
 function anonymousRequestHasNoPrincipal(): void {
   assert(principalOf(testRequest(Get, "/")).isNone(), "none");
-  const req = withoutPrincipal(withPrincipal(testRequest(Get, "/"), newPrincipal("a", [], [], ViaSession)));
+  const req = withoutPrincipal(
+    withPrincipal(testRequest(Get, "/"), newPrincipal("a", [], [], ViaSession)),
+  );
   assert(principalOf(req).isNone(), "cleared");
 }
 

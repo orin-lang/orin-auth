@@ -2,14 +2,16 @@ import { assert, assertEq, assertEqString, assertEqBool, fail } from "std:test";
 import { Get, Post } from "std:http";
 import { scope } from "std:task";
 import {
-  Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertBody, assertHeader, assertNoHeader,
-  withMiddleware, internalError,
+  Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertBody,
+  assertHeader, assertNoHeader, withMiddleware, internalError,
 } from "orin-web";
 import {
-  MemorySessionStore, SessionManager, defaultSessionConfig, countingRandom, fixedClock, Authenticator, AuthOutcome, AuthAnonymous,
-  AuthPassed, AuthFailed, noExtras, authenticate, sessionAuthenticator, Principal, ViaJwt, ViaApiToken, principalOf, newPrincipal,
-  requireAuthenticated, requireRole, requireAnyRole, requireScope, requireAllScopes, requirePrincipal, defaultAuthzConfig,
-  pagesAuthzConfig, mixedAuthzConfig, AuthzConfig, DenyRedirect, DenyJson, safeNext, currentPrincipal, hasRole,
+  MemorySessionStore, SessionManager, defaultSessionConfig, countingRandom, fixedClock,
+  Authenticator, AuthOutcome, AuthAnonymous, AuthPassed, AuthFailed, noExtras, authenticate,
+  sessionAuthenticator, Principal, ViaJwt, ViaApiToken, principalOf, newPrincipal,
+  requireAuthenticated, requireRole, requireAnyRole, requireScope, requireAllScopes,
+  requirePrincipal, defaultAuthzConfig, pagesAuthzConfig, mixedAuthzConfig, AuthzConfig,
+  DenyRedirect, DenyJson, safeNext, currentPrincipal, hasRole,
 } from "../src/module";
 
 // A fake authenticator: the header X-Test-User: name:role1+role2:scope1+scope2 authenticates; X-Test-Bad rejects.
@@ -146,7 +148,10 @@ function forbiddenCanRedirectToo(): void {
 function customRules(): void {
   let app = new Router();
   app.use(authenticate([fakeAuth], fixedClock(1000)));
-  const ownerOrAdmin = requirePrincipal(defaultAuthzConfig(), (p: Principal): bool => p.subject == "owner" || hasRole(p, "admin"));
+  const ownerOrAdmin = requirePrincipal(
+    defaultAuthzConfig(),
+    (p: Principal): bool => p.subject == "owner" || hasRole(p, "admin"),
+  );
   app.get("/doc", withMiddleware(ownerOrAdmin, ok));
   const c = new TestClient(app);
   assertStatus(user(c, "owner").get("/doc"), 200);
@@ -158,7 +163,10 @@ function customRules(): void {
 function clientCannotForgeAPrincipal(): void {
   // Attributes are server-side only: no header or query value becomes the principal.
   const c = new TestClient(appWith(defaultAuthzConfig()));
-  const r = c.withHeader("auth.principal", "jwt|root|admin|deploy").withHeader("X-Auth-Principal", "root").get("/admin");
+  const r = c
+      .withHeader("auth.principal", "jwt|root|admin|deploy")
+      .withHeader("X-Auth-Principal", "root")
+      .get("/admin");
   assertStatus(r, 401);
 }
 
@@ -166,8 +174,11 @@ function clientCannotForgeAPrincipal(): void {
 function earlierPrincipalIsClearedBeforeAuthenticatorsRun(): void {
   let app = new Router();
   // an earlier (buggy or hostile) middleware sets a principal; `authenticate` must not let it stand
-  app.use((req: Request, next: (r: Request) => Result<Response, WebError>): Result<Response, WebError> =>
-    next(req.withAttr("auth.principal", "jwt|root|admin|")));
+  app.use(
+    (req: Request, next: (r: Request) => Result<Response, WebError>): Result<Response, WebError> => next(
+      req.withAttr("auth.principal", "jwt|root|admin|"),
+    ),
+  );
   app.use(authenticate([fakeAuth], fixedClock(1000)));
   app.get("/admin", withMiddleware(requireRole(defaultAuthzConfig(), "admin"), ok));
   assertStatus(new TestClient(app).get("/admin"), 401);
@@ -177,10 +188,13 @@ function earlierPrincipalIsClearedBeforeAuthenticatorsRun(): void {
 function currentPrincipalForHandlers(): void {
   let app = new Router();
   app.use(authenticate([fakeAuth], fixedClock(1000)));
-  app.get("/who", (req: Request): Result<Response, WebError> => {
-    const me = currentPrincipal(req)?;
-    return Ok(Response.text(200, me.subject));
-  });
+  app.get(
+    "/who",
+    (req: Request): Result<Response, WebError> => {
+      const me = currentPrincipal(req)?;
+      return Ok(Response.text(200, me.subject));
+    },
+  );
   const c = new TestClient(app);
   assertStatus(c.get("/who"), 401);
   assertBody(user(c, "ann").get("/who"), "ann");
@@ -206,17 +220,25 @@ function sessionsAuthenticateThroughTheMiddleware(): void {
     const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
     let app = new Router();
     app.use(authenticate([sessionAuthenticator(mgr)], fixedClock(5000)));
-    app.post("/login", (req: Request): Result<Response, WebError> => {
-      const made = mgr.login(req, 5000, "ann", ["admin"], []);
-      if (made.isErr()) {
-        return Err(internalError("login failed"));
-      }
-      return Ok(Response.text(200, "in").withAddedHeader("Set-Cookie", made.unwrap().setCookie));
-    });
+    app.post(
+      "/login",
+      (req: Request): Result<Response, WebError> => {
+        const made = mgr.login(req, 5000, "ann", ["admin"], []);
+        if (made.isErr()) {
+          return Err(internalError("login failed"));
+        }
+        return Ok(Response.text(200, "in").withAddedHeader("Set-Cookie", made.unwrap().setCookie));
+      },
+    );
     app.get("/admin", withMiddleware(requireRole(defaultAuthzConfig(), "admin"), ok));
-    app.post("/logout", (req: Request): Result<Response, WebError> => {
-      return Ok(Response.text(200, "out").withAddedHeader("Set-Cookie", mgr.logout(req).unwrap()));
-    });
+    app.post(
+      "/logout",
+      (req: Request): Result<Response, WebError> => {
+        return Ok(
+          Response.text(200, "out").withAddedHeader("Set-Cookie", mgr.logout(req).unwrap()),
+        );
+      },
+    );
     const c = new TestClient(app);
     assertStatus(c.get("/admin"), 401);
     const login = c.send(testRequest(Post, "/login"));

@@ -1,0 +1,563 @@
+// OpenID Connect relying party: the authorization code flow with PKCE (S256), `state` and `nonce` (OpenID Connect Core 1.0 3.1,
+// RFC 7636, RFC 9700 recommendations).
+//
+//   1. beginLogin(...)      builds the redirect to the provider and remembers a TRANSACTION (state, nonce, PKCE verifier) on the
+//                           server, bound to the browser by a short-lived cookie.
+//   2. the user authenticates at the provider and is sent back to `redirectUri?code=..&state=..`
+//   3. completeLogin(...)   takes the transaction (single use, expires), checks `state` and the browser binding, exchanges the code
+//                           for tokens, validates the ID token (signature, iss, aud, exp, nonce) and returns the identity.
+//                           Turning the identity into a session is the application's step: `SessionManager.login(..)`.
+//
+// WHAT IS PLUGGABLE, AND WHY
+//   * HTTP: `OidcHttp` is a function value. std has no HTTP client and std:net has no TLS, and OIDC providers speak HTTPS only, so
+//     orin-auth cannot fetch anything itself. Supply a function backed by your platform's client (an Orbit Cloud host call, a
+//     reverse proxy, a sidecar). `parseDiscovery` and `parseJwks` are pure, so the documents can also come from configuration.
+//   * ID token validation: `IdTokenValidator` is a function value. `jwtIdTokenValidator(keys, options)` is the standard one built on
+//     jwt.or. Providers sign ID tokens with RS256 (or ES256), which needs `std:crypto`; until then pass `JwtExternalKey`s whose
+//     verifier you provide (`jwksKeys` builds them from a JWKS with your RSA verifier factory). Everything around the signature
+//     (iss, aud, azp, exp, nonce, state, PKCE) is implemented and tested here.
+//   * A symmetric (`oct`) JWK is NEVER turned into a key: a provider's key document must not be able to make orin-auth accept
+//     HMAC tokens.
+import { Bytes } from "std:bytes";
+import {
+  JsonValue, ValueObject, ValueArray, ValueString, parseDocument, defaultReadOptions,
+} from "std:json";
+import { PercentSpace, QueryPair, percentEncode } from "std:url";
+import { toLowerAscii } from "std:http";
+import { Scope } from "std:task";
+import { AuthError, authErrorMessage } from "./error";
+import { RandomFn } from "./services";
+import { CookieAttrs, setCookieValue } from "./cookie";
+import {
+  VerifiedJwt, JwtKey, JwtOptions, JwtError, JwtAlg, JwtRS256, JwtES256, SignatureVerifier,
+  jwtExternalKey, verifyJwt, jwtErrorMessage, jsonMemberOf, claimString, claimStrings, claimInt,
+} from "./jwt";
+import { KvHandle, startKv } from "./internal/kv";
+import {
+  sha256, hexEncode, base64Encode, base64UrlEncode, base64UrlDecode, constantTimeEqualsText,
+  textToBytes,
+} from "./internal/crypto";
+
+// ------------------------------------------------------------------------------------------------------------ configuration
+
+export type OidcProvider = {
+  issuer: string;
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+  jwksUri: string;
+};
+
+// clientSecret: None for a public client (PKCE only). redirectUri: exactly as registered with the provider.
+export type OidcClient = {
+  clientId: string;
+  clientSecret: Option<string>;
+  redirectUri: string;
+  scopes: string[];
+};
+
+export type OidcHttpRequest = { method: string; url: string; headers: QueryPair[]; body: string; };
+export type OidcHttpResponse = { status: int; body: string; };
+export type OidcHttp = (req: OidcHttpRequest) => Result<OidcHttpResponse, string>;
+
+export type OidcErrorKind =
+  OidcDiscoveryInvalid // the discovery or JWKS document is unusable (wrong issuer, an endpoint that is not https, bad JSON)
+  | OidcStateInvalid // unknown, expired, replayed or not-for-this-browser state
+  | OidcProviderError // the provider answered with an `error` (access_denied, ...)
+  | OidcTokenExchange // the token endpoint call failed
+  | OidcTokenInvalid // the ID token failed validation
+  | OidcNonceMismatch
+  | OidcInternal; // no entropy, store gone, cookie configuration
+
+export type OidcError = { kind: OidcErrorKind; detail: string; };
+
+function oerr(kind: OidcErrorKind, detail: string): OidcError {
+  return OidcError { kind: kind, detail: detail };
+}
+
+export function oidcErrorMessage(e: OidcError): string {
+  return e.detail;
+}
+
+// ------------------------------------------------------------------------------------------------------------ discovery and JWKS
+
+function isHttps(u: string, allowHttp: bool): bool {
+  return u.startsWith("https://") || allowHttp && u.startsWith("http://");
+}
+
+// discoveryUrl(issuer): string -- `<issuer>/.well-known/openid-configuration`.
+export function discoveryUrl(issuer: string): string {
+  return (issuer.endsWith("/") ? issuer.substring(0, issuer.length - 1) : issuer)
+      + "/.well-known/openid-configuration";
+}
+
+// parseDiscovery(text, expectedIssuer, allowHttp): Result<OidcProvider, OidcError> -- the `issuer` of the document must equal the
+// issuer you asked for (OIDC Discovery 4.3: otherwise a document could claim another provider's identity), and every endpoint must
+// be https (`allowHttp` only for local development).
+export function parseDiscovery(
+  text: string,
+  expectedIssuer: string,
+  allowHttp: bool,
+): Result<OidcProvider, OidcError> {
+  const doc = parseDocument(text, defaultReadOptions());
+  if (doc.isErr()) {
+    return Err(oerr(OidcDiscoveryInvalid, "the discovery document is not valid JSON"));
+  }
+  const issuer = claimString(doc.unwrap(), "issuer");
+  const auth = claimString(doc.unwrap(), "authorization_endpoint");
+  const token = claimString(doc.unwrap(), "token_endpoint");
+  const jwks = claimString(doc.unwrap(), "jwks_uri");
+  if (issuer.isNone() || auth.isNone() || token.isNone() || jwks.isNone()) {
+    return Err(
+      oerr(
+        OidcDiscoveryInvalid,
+        "the discovery document lacks issuer, authorization_endpoint, token_endpoint or jwks_uri",
+      ),
+    );
+  }
+  if (issuer.unwrap() != expectedIssuer) {
+    return Err(oerr(OidcDiscoveryInvalid, "the discovery document is for another issuer"));
+  }
+  if (!isHttps(auth.unwrap(), allowHttp)
+      || !isHttps(token.unwrap(), allowHttp)
+      || !isHttps(jwks.unwrap(), allowHttp)) {
+    return Err(oerr(OidcDiscoveryInvalid, "provider endpoints must use https"));
+  }
+  return Ok(OidcProvider {
+    issuer: issuer.unwrap(),
+    authorizationEndpoint: auth.unwrap(),
+    tokenEndpoint: token.unwrap(),
+    jwksUri: jwks.unwrap(),
+  });
+}
+
+// fetchProvider(http, issuer, allowHttp): Result<OidcProvider, OidcError> -- GET the discovery document and parse it.
+export function fetchProvider(
+  http: OidcHttp,
+  issuer: string,
+  allowHttp: bool,
+): Result<OidcProvider, OidcError> {
+  const r = http(OidcHttpRequest {
+    method: "GET",
+    url: discoveryUrl(issuer),
+    headers: [QueryPair { key: "Accept", value: "application/json" }],
+    body: "",
+  });
+  if (r.isErr()) {
+    return Err(oerr(OidcDiscoveryInvalid, "discovery request failed"));
+  }
+  if (r.unwrap().status != 200) {
+    return Err(oerr(OidcDiscoveryInvalid, "discovery answered " + r.unwrap().status.toString()));
+  }
+  return parseDiscovery(r.unwrap().body, issuer, allowHttp);
+}
+
+// One key of a JWK Set. Only the fields a verifier needs; `kty` "RSA" has n and e (big-endian bytes), "EC" has crv, x, y.
+export type Jwk = {
+  kid: Option<string>;
+  kty: string;
+  alg: Option<string>;
+  use: Option<string>;
+  n: Option<Bytes>;
+  e: Option<Bytes>;
+  crv: Option<string>;
+  x: Option<Bytes>;
+  y: Option<Bytes>;
+};
+
+function b64Field(o: JsonValue, name: string): Option<Bytes> {
+  const s = claimString(o, name);
+  return s.isSome() ? base64UrlDecode(s.unwrap()) : None;
+}
+
+// parseJwks(text): Result<Jwk[], OidcError> -- a JWK Set. Keys that are malformed are skipped; symmetric keys (`oct`) are skipped
+// ALWAYS (see the module comment).
+export function parseJwks(text: string): Result<Jwk[], OidcError> {
+  const doc = parseDocument(text, defaultReadOptions());
+  if (doc.isErr()) {
+    return Err(oerr(OidcDiscoveryInvalid, "the JWKS is not valid JSON"));
+  }
+  const keys = jsonMemberOf(doc.unwrap(), "keys");
+  if (keys.isNone()) {
+    return Err(oerr(OidcDiscoveryInvalid, "the JWKS has no keys array"));
+  }
+  let out: Jwk[] = [];
+  match (keys.unwrap()) {
+    ValueArray(xs) => {
+      for (const k of xs) {
+        const kty = claimString(k, "kty");
+        if (kty.isSome() && (kty.unwrap() == "RSA" || kty.unwrap() == "EC")) {
+          out.push(Jwk {
+            kid: claimString(k, "kid"),
+            kty: kty.unwrap(),
+            alg: claimString(k, "alg"),
+            use: claimString(k, "use"),
+            n: b64Field(k, "n"),
+            e: b64Field(k, "e"),
+            crv: claimString(k, "crv"),
+            x: b64Field(k, "x"),
+            y: b64Field(k, "y"),
+          });
+        }
+      }
+    },
+    _ => {
+      return Err(oerr(OidcDiscoveryInvalid, "keys is not an array"));
+    },
+  }
+  return Ok(out);
+}
+
+// fetchJwks(http, provider): Result<Jwk[], OidcError>
+export function fetchJwks(http: OidcHttp, provider: OidcProvider): Result<Jwk[], OidcError> {
+  const r = http(OidcHttpRequest {
+    method: "GET",
+    url: provider.jwksUri,
+    headers: [QueryPair { key: "Accept", value: "application/json" }],
+    body: "",
+  });
+  if (r.isErr() || r.unwrap().status != 200) {
+    return Err(oerr(OidcDiscoveryInvalid, "the JWKS request failed"));
+  }
+  return parseJwks(r.unwrap().body);
+}
+
+// Builds a verifier for an RSA public key (modulus, exponent) -- supplied by std:crypto when it exists, or by the application.
+export type RsaVerifierFactory = (modulus: Bytes, exponent: Bytes) => Option<SignatureVerifier>;
+
+// jwksKeys(jwks, rsa): JwtKey[] -- the RSA keys with `use` sig (or absent) and `alg` RS256 (or absent) as external RS256 keys.
+// EC keys are skipped until ES256 verification exists. Keys without `kid` are kept (matched when the token has no kid).
+export function jwksKeys(jwks: Jwk[], rsa: RsaVerifierFactory): JwtKey[] {
+  let out: JwtKey[] = [];
+  for (const k of jwks) {
+    const sigUse = k.use.isNone() || k.use.unwrap() == "sig";
+    const rsAlg = k.alg.isNone() || k.alg.unwrap() == "RS256";
+    if (k.kty == "RSA" && sigUse && rsAlg && k.n.isSome() && k.e.isSome()) {
+      const v = rsa(k.n.unwrap(), k.e.unwrap());
+      if (v.isSome()) {
+        const key = jwtExternalKey(k.kid, JwtRS256, v.unwrap());
+        if (key.isOk()) {
+          out.push(key.unwrap());
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------------------------------------------------ transactions
+
+// What the server remembers between the redirect and the callback. Keyed by SHA-256 of the state. `binding` is SHA-256 of the value
+// in the browser's cookie.
+export type OidcTransaction = {
+  stateHash: string;
+  nonce: string;
+  codeVerifier: string;
+  binding: string;
+  returnTo: string;
+  expiresAt: int;
+};
+
+export interface OidcTxnStore {
+  save(txn: OidcTransaction): bool;
+  take(stateHash: string): Option<OidcTransaction>;
+}
+
+// take() is atomic (get + remove in the owner task), so a callback cannot be replayed even by two parallel requests.
+export class MemoryOidcTxnStore implements OidcTxnStore {
+  private kv: KvHandle<OidcTransaction>;
+
+  constructor(kv: KvHandle<OidcTransaction>) {
+    this.kv = kv;
+  }
+
+  static start(s: Scope): MemoryOidcTxnStore {
+    return new MemoryOidcTxnStore(startKv<OidcTransaction>(s));
+  }
+
+  save(txn: OidcTransaction): bool {
+    return this.kv.put(txn.stateHash, txn);
+  }
+
+  take(stateHash: string): Option<OidcTransaction> {
+    const cur = this.kv.get(stateHash);
+    if (cur.isNone()) {
+      return None;
+    }
+    // remove() answers whether THIS call removed it, so of two racing callers only one gets the transaction.
+    return this.kv.remove(stateHash) ? cur : None;
+  }
+
+  size(): int {
+    return this.kv.count();
+  }
+
+  // sweep(now): int -- drops expired transactions.
+  sweep(now: int): int {
+    return this.kv.sweep((t: OidcTransaction): bool => now >= t.expiresAt);
+  }
+
+  close(): void {
+    this.kv.close();
+  }
+}
+
+// ------------------------------------------------------------------------------------------------------------ step 1: begin
+
+export type LoginStart = { url: string; setCookie: string; };
+
+export const OIDC_TXN_SECONDS: int = 600;
+
+function query(params: QueryPair[]): string {
+  let out = "";
+  let first = true;
+  for (const p of params) {
+    out = out + (first ? "" : "&") + percentEncode(p.key, PercentSpace) + "="
+        + percentEncode(p.value, PercentSpace);
+    first = false;
+  }
+  return out;
+}
+
+function joinUrl(base: string, q: string): string {
+  return base + (base.includes("?") ? "&" : "?") + q;
+}
+
+function sha256B64(s: string): string {
+  return base64UrlEncode(sha256(textToBytes(s)));
+}
+
+// pkceChallenge(verifier): string -- BASE64URL(SHA256(ASCII(verifier))) (RFC 7636 4.2, method S256).
+export function pkceChallenge(verifier: string): string {
+  return sha256B64(verifier);
+}
+
+function randomText(random: RandomFn, n: usize): Result<string, OidcError> {
+  const b = random(n);
+  if (b.isErr()) {
+    return Err(oerr(OidcInternal, authErrorMessage(b.unwrapErr())));
+  }
+  return Ok(base64UrlEncode(b.unwrap()));
+}
+
+// beginLogin(provider, client, store, random, bindingCookie, now, returnTo): Result<LoginStart, OidcError>
+// `url` is where to redirect the browser (303). `setCookie` must be sent with that redirect: it ties the transaction to this browser.
+// `bindingCookie` names it, with attributes `cookie` (SameSite=Lax is required: the callback is a cross-site top-level GET).
+// `returnTo` is where to send the user after login; the application should pass a `safeNext(..)` value.
+export function beginLogin(
+  provider: OidcProvider,
+  client: OidcClient,
+  store: OidcTxnStore,
+  random: RandomFn,
+  bindingCookie: string,
+  cookie: CookieAttrs,
+  now: int,
+  returnTo: string,
+): Result<LoginStart, OidcError> {
+  const state = randomText(random, 32)?;
+  const nonce = randomText(random, 32)?;
+  const verifier = randomText(random, 32)?;
+  const binding = randomText(random, 16)?;
+  const set = setCookieValue(
+    bindingCookie,
+    binding,
+    CookieAttrs { ...cookie, maxAge: Some(OIDC_TXN_SECONDS) },
+  );
+  if (set.isErr()) {
+    return Err(oerr(OidcInternal, authErrorMessage(set.unwrapErr())));
+  }
+  const txn = OidcTransaction {
+    stateHash: sha256B64(state),
+    nonce: nonce,
+    codeVerifier: verifier,
+    binding: sha256B64(binding),
+    returnTo: returnTo,
+    expiresAt: now + OIDC_TXN_SECONDS * 1000,
+  };
+  if (!store.save(txn)) {
+    return Err(oerr(OidcInternal, "the transaction store is not available"));
+  }
+  let scopes = client.scopes;
+  if (!scopes.includes("openid")) {
+    scopes = ["openid"].concat(scopes);
+  }
+  const params = [
+    QueryPair { key: "response_type", value: "code" },
+    QueryPair { key: "client_id", value: client.clientId },
+    QueryPair { key: "redirect_uri", value: client.redirectUri },
+    QueryPair { key: "scope", value: scopes.join(" ") },
+    QueryPair { key: "state", value: state },
+    QueryPair { key: "nonce", value: nonce },
+    QueryPair { key: "code_challenge", value: pkceChallenge(verifier) },
+    QueryPair { key: "code_challenge_method", value: "S256" },
+  ];
+  return Ok(LoginStart {
+    url: joinUrl(provider.authorizationEndpoint, query(params)),
+    setCookie: set.unwrap(),
+  });
+}
+
+// ------------------------------------------------------------------------------------------------------------ step 3: complete
+
+export type OidcIdentity = {
+  issuer: string;
+  subject: string;
+  claims: JsonValue;
+  idToken: string;
+  accessToken: Option<string>;
+  returnTo: string;
+};
+
+// A validator turns an ID token string into verified claims, or an error. `now` is milliseconds since the epoch.
+export type IdTokenValidator = (idToken: string, now: int) => Result<VerifiedJwt, JwtError>;
+
+// jwtIdTokenValidator(keys, options): IdTokenValidator -- verifyJwt with these keys. Set `options.issuer` to the provider's issuer and
+// `options.audience` to the client id; completeLogin also checks both itself, so a validator built without them is still safe.
+export function jwtIdTokenValidator(keys: JwtKey[], options: JwtOptions): IdTokenValidator {
+  return (idToken: string, now: int): Result<VerifiedJwt, JwtError> => verifyJwt(
+    idToken,
+    keys,
+    options,
+    now,
+  );
+}
+
+// tokenRequest(provider, client, code, verifier): OidcHttpRequest -- the token endpoint call (RFC 6749 4.1.3 + RFC 7636 4.5). A
+// confidential client authenticates with HTTP Basic (client_secret_basic); a public client sends only client_id.
+export function tokenRequest(
+  provider: OidcProvider,
+  client: OidcClient,
+  code: string,
+  verifier: string,
+): OidcHttpRequest {
+  let params = [
+    QueryPair { key: "grant_type", value: "authorization_code" },
+    QueryPair { key: "code", value: code },
+    QueryPair { key: "redirect_uri", value: client.redirectUri },
+    QueryPair { key: "code_verifier", value: verifier },
+  ];
+  let headers = [
+    QueryPair { key: "Content-Type", value: "application/x-www-form-urlencoded" },
+    QueryPair { key: "Accept", value: "application/json" },
+  ];
+  if (client.clientSecret.isSome()) {
+    const cred = percentEncode(client.clientId, PercentSpace) + ":"
+        + percentEncode(client.clientSecret.unwrap(), PercentSpace);
+    headers.push(QueryPair { key: "Authorization", value: "Basic " + encodeBasic(cred) });
+  } else {
+    params.push(QueryPair { key: "client_id", value: client.clientId });
+  }
+  return OidcHttpRequest {
+    method: "POST",
+    url: provider.tokenEndpoint,
+    headers: headers,
+    body: query(params),
+  };
+}
+
+function encodeBasic(cred: string): string {
+  return base64Encode(textToBytes(cred));
+}
+
+function param(params: QueryPair[], key: string): Option<string> {
+  for (const p of params) {
+    if (p.key == key) {
+      return Some(p.value);
+    }
+  }
+  return None;
+}
+
+// completeLogin(provider, client, store, http, validate, bindingCookieValue, params, now): Result<OidcIdentity, OidcError>
+//   params: the query parameters of the callback request. bindingCookieValue: the value of the binding cookie from the callback request.
+// Checks, in order: no `error` from the provider; `state` and `code` present; the transaction exists (taken atomically: single
+// use), has not expired and belongs to this browser; the token exchange succeeds; the ID token validates; its issuer is the
+// provider's, its audience contains our client id (and `azp` equals it when there are several audiences), and its nonce equals the
+// one we sent.
+export function completeLogin(
+  provider: OidcProvider,
+  client: OidcClient,
+  store: OidcTxnStore,
+  http: OidcHttp,
+  validate: IdTokenValidator,
+  bindingCookieValue: Option<string>,
+  params: QueryPair[],
+  now: int,
+): Result<OidcIdentity, OidcError> {
+  const state = param(params, "state");
+  if (state.isNone() || state.unwrap().length == 0 || state.unwrap().length > 256) {
+    return Err(oerr(OidcStateInvalid, "missing state"));
+  }
+  // take first: the transaction is spent whatever happens next
+  const txn = store.take(sha256B64(state.unwrap()));
+  const providerError = param(params, "error");
+  if (providerError.isSome()) {
+    return Err(oerr(OidcProviderError, "the provider refused: " + providerError.unwrap()));
+  }
+  if (txn.isNone()) {
+    return Err(oerr(OidcStateInvalid, "unknown or already used state"));
+  }
+  const t = txn.unwrap();
+  if (now >= t.expiresAt) {
+    return Err(oerr(OidcStateInvalid, "the login took too long"));
+  }
+  if (bindingCookieValue.isNone()
+      || !constantTimeEqualsText(sha256B64(bindingCookieValue.unwrap()), t.binding)) {
+    return Err(oerr(OidcStateInvalid, "this browser did not start the login"));
+  }
+  const code = param(params, "code");
+  if (code.isNone() || code.unwrap().length == 0) {
+    return Err(oerr(OidcStateInvalid, "missing code"));
+  }
+  const resp = http(tokenRequest(provider, client, code.unwrap(), t.codeVerifier));
+  if (resp.isErr()) {
+    return Err(oerr(OidcTokenExchange, "the token request failed"));
+  }
+  if (resp.unwrap().status != 200) {
+    return Err(
+      oerr(OidcTokenExchange, "the token endpoint answered " + resp.unwrap().status.toString()),
+    );
+  }
+  const body = parseDocument(resp.unwrap().body, defaultReadOptions());
+  if (body.isErr()) {
+    return Err(oerr(OidcTokenExchange, "the token response is not JSON"));
+  }
+  const idToken = claimString(body.unwrap(), "id_token");
+  if (idToken.isNone()) {
+    return Err(oerr(OidcTokenExchange, "the token response has no id_token"));
+  }
+  const v = validate(idToken.unwrap(), now);
+  if (v.isErr()) {
+    return Err(oerr(OidcTokenInvalid, jwtErrorMessage(v.unwrapErr())));
+  }
+  const claims = v.unwrap().claims;
+  const iss = claimString(claims, "iss");
+  if (iss.isNone() || iss.unwrap() != provider.issuer) {
+    return Err(oerr(OidcTokenInvalid, "wrong issuer"));
+  }
+  const aud = claimStrings(claims, "aud");
+  if (!aud.includes(client.clientId)) {
+    return Err(oerr(OidcTokenInvalid, "the token is not for this client"));
+  }
+  if (aud.length > 1) {
+    const azp = claimString(claims, "azp");
+    if (azp.isNone() || azp.unwrap() != client.clientId) {
+      return Err(oerr(OidcTokenInvalid, "azp does not match the client"));
+    }
+  }
+  const nonce = claimString(claims, "nonce");
+  if (nonce.isNone() || !constantTimeEqualsText(nonce.unwrap(), t.nonce)) {
+    return Err(oerr(OidcNonceMismatch, "nonce does not match"));
+  }
+  const sub = claimString(claims, "sub");
+  if (sub.isNone() || sub.unwrap().length == 0) {
+    return Err(oerr(OidcTokenInvalid, "the token has no subject"));
+  }
+  return Ok(OidcIdentity {
+    issuer: provider.issuer,
+    subject: sub.unwrap(),
+    claims: claims,
+    idToken: idToken.unwrap(),
+    accessToken: claimString(body.unwrap(), "access_token"),
+    returnTo: t.returnTo,
+  });
+}

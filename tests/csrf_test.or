@@ -3,11 +3,13 @@ import { Get, Post, Put, Delete } from "std:http";
 import { Bytes, fromString } from "std:bytes";
 import { scope } from "std:task";
 import {
-  Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertBody, internalError,
+  Router, Request, Response, WebError, TestClient, testRequest, assertStatus, assertBody,
+  internalError,
 } from "orin-web";
 import {
-  MemorySessionStore, SessionManager, defaultSessionConfig, countingRandom, fixedClock, authenticate, sessionAuthenticator,
-  CsrfConfig, CsrfProtection, CsrfHeaderMode, defaultCsrfConfig, RandomService, RandomFn,
+  MemorySessionStore, SessionManager, defaultSessionConfig, countingRandom, fixedClock,
+  authenticate, sessionAuthenticator, CsrfConfig, CsrfProtection, CsrfHeaderMode, defaultCsrfConfig,
+  RandomService, RandomFn,
 } from "../src/module";
 import { setCookieValueOf } from "./support";
 
@@ -18,20 +20,26 @@ function build(cfg: CsrfConfig, mgr: SessionManager, rnd: RandomFn): Router {
   let app = new Router();
   app.use(authenticate([sessionAuthenticator(mgr)], fixedClock(1000)));
   app.use(csrf.middleware());
-  app.get("/form", (req: Request): Result<Response, WebError> => {
-    const t = csrf.token(req);
-    if (t.isErr()) {
-      return Err(internalError("no token"));
-    }
-    return Ok(Response.text(200, t.unwrap()));
-  });
+  app.get(
+    "/form",
+    (req: Request): Result<Response, WebError> => {
+      const t = csrf.token(req);
+      if (t.isErr()) {
+        return Err(internalError("no token"));
+      }
+      return Ok(Response.text(200, t.unwrap()));
+    },
+  );
   app.post("/act", (req: Request): Result<Response, WebError> => Ok(Response.text(200, "done")));
   app.put("/act", (req: Request): Result<Response, WebError> => Ok(Response.text(200, "done")));
   app.delete("/act", (req: Request): Result<Response, WebError> => Ok(Response.text(200, "done")));
-  app.post("/login", (req: Request): Result<Response, WebError> => {
-    const made = mgr.login(req, 1000, "ann", [], []);
-    return Ok(Response.text(200, "in").withAddedHeader("Set-Cookie", made.unwrap().setCookie));
-  });
+  app.post(
+    "/login",
+    (req: Request): Result<Response, WebError> => {
+      const made = mgr.login(req, 1000, "ann", [], []);
+      return Ok(Response.text(200, "in").withAddedHeader("Set-Cookie", made.unwrap().setCookie));
+    },
+  );
   return app;
 }
 
@@ -109,7 +117,12 @@ function aTokenFromAnotherBrowserDoesNotWork(): void {
     const victimBinding = setCookieValueOf(victim, "__Host-csrf");
     assert(setCookieValueOf(attacker, "__Host-csrf") != victimBinding, "bindings differ");
     // the attacker's own valid token, replayed with the victim's cookie
-    assertStatus(c.withHeader("Cookie", "__Host-csrf=" + victimBinding).send(post("/act").withHeader("X-CSRF-Token", attackerToken)), 403);
+    assertStatus(
+      c
+          .withHeader("Cookie", "__Host-csrf=" + victimBinding)
+          .send(post("/act").withHeader("X-CSRF-Token", attackerToken)),
+      403,
+    );
     rnd.stop();
     store.close();
   });
@@ -137,7 +150,11 @@ function tokensAreBoundToTheSession(): void {
     assertStatus(bob.send(post("/act").withHeader("X-CSRF-Token", annToken)), 403);
     assertStatus(ann.send(post("/act")), 403);
     // a session needs no extra Set-Cookie for the binding
-    assertEq(ann.get("/form").headers().getAll("set-cookie").length.toInt(), 0, "no csrf cookie for a session");
+    assertEq(
+      ann.get("/form").headers().getAll("set-cookie").length.toInt(),
+      0,
+      "no csrf cookie for a session",
+    );
     rnd.stop();
     store.close();
   });
@@ -154,11 +171,17 @@ function formFieldsCarryTheTokenToo(): void {
     const binding = setCookieValueOf(page, "__Host-csrf");
     const token = page.bodyText();
     const browser = c.withHeader("Cookie", "__Host-csrf=" + binding);
-    const form = post("/act").withHeader("Content-Type", "application/x-www-form-urlencoded").withBody(fromString("a=1&csrf_token=" + token + "&b=2"));
+    const form = post("/act")
+        .withHeader("Content-Type", "application/x-www-form-urlencoded")
+        .withBody(fromString("a=1&csrf_token=" + token + "&b=2"));
     assertStatus(browser.send(form), 200);
-    const bad = post("/act").withHeader("Content-Type", "application/x-www-form-urlencoded").withBody(fromString("a=1&csrf_token=nope"));
+    const bad = post("/act")
+        .withHeader("Content-Type", "application/x-www-form-urlencoded")
+        .withBody(fromString("a=1&csrf_token=nope"));
     assertStatus(browser.send(bad), 403);
-    const json = post("/act").withHeader("Content-Type", "application/json").withBody(fromString("{\"csrf_token\":\"" + token + "\"}"));
+    const json = post("/act")
+        .withHeader("Content-Type", "application/json")
+        .withBody(fromString("{\"csrf_token\":\"" + token + "\"}"));
     assertStatus(browser.send(json), 403);
     rnd.stop();
     store.close();
@@ -171,7 +194,13 @@ function customHeaderModeRequiresTheHeader(): void {
     const store = MemorySessionStore.start(s);
     const rnd = countingRandom(s);
     const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
-    const c = new TestClient(build(CsrfConfig { ...defaultCsrfConfig(), mode: CsrfHeaderMode("X-Requested-With") }, mgr, rnd.bytes));
+    const c = new TestClient(
+      build(
+        CsrfConfig { ...defaultCsrfConfig(), mode: CsrfHeaderMode("X-Requested-With") },
+        mgr,
+        rnd.bytes,
+      ),
+    );
     assertStatus(c.send(post("/act")), 403);
     assertStatus(c.send(post("/act").withHeader("X-Requested-With", "")), 403);
     assertStatus(c.send(post("/act").withHeader("X-Requested-With", "fetch")), 200);
@@ -187,9 +216,15 @@ function originAndFetchMetadataAreChecked(): void {
     const store = MemorySessionStore.start(s);
     const rnd = countingRandom(s);
     const mgr = SessionManager.create(store, rnd.bytes, defaultSessionConfig()).unwrap();
-    const c = new TestClient(build(CsrfConfig { ...defaultCsrfConfig(), mode: CsrfHeaderMode("X-Requested-With") }, mgr, rnd.bytes))
-      .withHeader("X-Requested-With", "fetch")
-      .withHeader("Host", "app.example");
+    const c = new TestClient(
+      build(
+        CsrfConfig { ...defaultCsrfConfig(), mode: CsrfHeaderMode("X-Requested-With") },
+        mgr,
+        rnd.bytes,
+      ),
+    )
+        .withHeader("X-Requested-With", "fetch")
+        .withHeader("Host", "app.example");
     assertStatus(c.send(post("/act").withHeader("Origin", "https://app.example")), 200);
     assertStatus(c.send(post("/act").withHeader("Origin", "https://evil.example")), 403);
     assertStatus(c.send(post("/act").withHeader("Origin", "null")), 403);
@@ -237,8 +272,16 @@ function authorizationHeaderRequestsAndSkippedRequestsAreExempt(): void {
     assertStatus(c.send(post("/act")), 403);
     assertStatus(c.send(post("/act").withHeader("Authorization", "Bearer abc")), 200);
     const strict = CsrfConfig { ...defaultCsrfConfig(), exemptAuthorization: false };
-    assertStatus(new TestClient(build(strict, mgr, rnd.bytes)).send(post("/act").withHeader("Authorization", "Bearer abc")), 403);
-    const skipping = CsrfConfig { ...defaultCsrfConfig(), skip: (req: Request): bool => req.path() == "/act" };
+    assertStatus(
+      new TestClient(build(strict, mgr, rnd.bytes)).send(
+        post("/act").withHeader("Authorization", "Bearer abc"),
+      ),
+      403,
+    );
+    const skipping = CsrfConfig {
+      ...defaultCsrfConfig(),
+      skip: (req: Request): bool => req.path() == "/act",
+    };
     assertStatus(new TestClient(build(skipping, mgr, rnd.bytes)).send(post("/act")), 200);
     rnd.stop();
     store.close();
@@ -249,9 +292,30 @@ function authorizationHeaderRequestsAndSkippedRequestsAreExempt(): void {
 function configurationIsValidated(): void {
   scope(s => {
     const rnd = countingRandom(s);
-    assert(CsrfProtection.create(defaultCsrfConfig(), fromString("short"), rnd.bytes).isErr(), "short key");
-    assert(CsrfProtection.create(CsrfConfig { ...defaultCsrfConfig(), headerName: "bad name" }, fromString(KEY), rnd.bytes).isErr(), "header");
-    assert(CsrfProtection.create(CsrfConfig { ...defaultCsrfConfig(), mode: CsrfHeaderMode("bad name") }, fromString(KEY), rnd.bytes).isErr(), "required header");
+    assert(
+      CsrfProtection.create(defaultCsrfConfig(), fromString("short"), rnd.bytes).isErr(),
+      "short key",
+    );
+    assert(
+      CsrfProtection
+          .create(
+            CsrfConfig { ...defaultCsrfConfig(), headerName: "bad name" },
+            fromString(KEY),
+            rnd.bytes,
+          )
+          .isErr(),
+      "header",
+    );
+    assert(
+      CsrfProtection
+          .create(
+            CsrfConfig { ...defaultCsrfConfig(), mode: CsrfHeaderMode("bad name") },
+            fromString(KEY),
+            rnd.bytes,
+          )
+          .isErr(),
+      "required header",
+    );
     assert(CsrfProtection.create(defaultCsrfConfig(), fromString(KEY), rnd.bytes).isOk(), "ok");
     rnd.stop();
   });

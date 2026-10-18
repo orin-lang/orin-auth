@@ -42,7 +42,12 @@ function authMethodOf(name: string): AuthMethod {
 }
 
 // newPrincipal(subject, roles, scopes, method)
-export function newPrincipal(subject: string, roles: string[], scopes: string[], method: AuthMethod): Principal {
+export function newPrincipal(
+  subject: string,
+  roles: string[],
+  scopes: string[],
+  method: AuthMethod,
+): Principal {
   return Principal { subject: subject, roles: roles, scopes: scopes, method: method };
 }
 
@@ -102,7 +107,8 @@ const PRINCIPAL_ATTR: string = "auth.principal";
 
 // withPrincipal(req, p): Request -- a copy of `req` that carries `p`. Replaces an earlier principal.
 export function withPrincipal(req: Request, p: Principal): Request {
-  const text = authMethodName(p.method) + "|" + percentEncode(p.subject, PercentSpace) + "|" + encodeList(p.roles) + "|" + encodeList(p.scopes);
+  const text = authMethodName(p.method) + "|" + percentEncode(p.subject, PercentSpace) + "|"
+      + encodeList(p.roles) + "|" + encodeList(p.scopes);
   return req.withAttr(PRINCIPAL_ATTR, text);
 }
 
@@ -126,12 +132,10 @@ export function principalOf(req: Request): Option<Principal> {
   if (subject.isErr()) {
     return None;
   }
-  return Some(
-    Principal {
-      subject: subject.unwrap(),
-      roles: decodeList(parts[2]),
-      scopes: decodeList(parts[3]),
-      method: authMethodOf(parts[0]),
-    },
-  );
+  return Some(Principal {
+    subject: subject.unwrap(),
+    roles: decodeList(parts[2]),
+    scopes: decodeList(parts[3]),
+    method: authMethodOf(parts[0]),
+  });
 }
