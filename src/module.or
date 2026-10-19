@@ -79,3 +79,10 @@ export {
   assertStatus, assertBody, assertHeader, ServerConfig, ServerHandle, defaultServerConfig, serve,
   Middlewares, newMiddlewares, WebErrorKind,
 } from "orin-web";
+
+// Pure primitives for edge adapters and custom authentication protocols.
+export {
+  sha256, hmacSha256, constantTimeEquals, constantTimeEqualsText, textToBytes, bytesToText,
+  base64UrlEncode, base64UrlDecode,
+} from "./crypto";
+export { sha1 } from "./crypto";

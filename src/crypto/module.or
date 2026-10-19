@@ -4,3 +4,4 @@ export {
   constantTimeEqualsText, hexDecode, hexEncode, hmacSha256, pbkdf2DefaultIterations,
   pbkdf2HmacSha256, sha256, textToBytes,
 } from "./crypto";
+export { sha1 } from "./sha1";

@@ -4,12 +4,12 @@ version = "0.1.0"
 entry = "src/module.or"
 
 [dependencies]
-orin-web = { git = "https://github.com/orin-lang/orin-web", rev = "50f69905bbdb44451a396bb8596f45462fd62fb0" }
+orin-web = { path = "../orin-web" }
 
 # Compiler-enforced module dependency policy. The package facade preserves the public API.
 
 [modules."."]
-allowed_dependencies = ["core", "credentials", "oidc", "protection", "sessions"]
+allowed_dependencies = ["core", "credentials", "crypto", "oidc", "protection", "sessions"]
 
 [modules.core]
 allowed_dependencies = ["crypto", "storage"]

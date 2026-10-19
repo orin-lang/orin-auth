@@ -155,7 +155,10 @@ authMethodName
 authMiddlewares
 authenticate
 badRequest
+base64UrlDecode
+base64UrlEncode
 beginLogin
+bytesToText
 chain
 checkCookie
 checkSessionConfig
@@ -165,6 +168,8 @@ claimStrings
 clearCookieValue
 completeLogin
 constantRandom
+constantTimeEquals
+constantTimeEqualsText
 cors
 countingRandom
 currentPrincipal
@@ -189,6 +194,7 @@ hasAnyRole
 hasRole
 hasScope
 hashPassword
+hmacSha256
 internalError
 isCookieValue
 isValidTokenPrefix
@@ -243,12 +249,15 @@ sessionAuthenticator
 sessionIdHash
 sessionIdHashOf
 setCookieValue
+sha1
+sha256
 signJwt
 splitToken
 startClock
 startRandom
 statusError
 testRequest
+textToBytes
 tokenFailureText
 tokenRequest
 unauthorized
