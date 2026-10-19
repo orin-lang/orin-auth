@@ -24,15 +24,15 @@ import { Bytes, fromString } from "std:bytes";
 import { PercentSpace, PlusAsSpace, parseQuery } from "std:url";
 import { methodName, isToken, toLowerAscii } from "std:http";
 import { Request, Response, WebError, Handler, Middleware, forbidden } from "orin-web";
-import { AuthError, authError, ConfigInvalid, InputInvalid } from "./error";
-import { RandomFn } from "./services";
+import { AuthError, authError, ConfigInvalid, InputInvalid } from "../core";
+import { RandomFn } from "../core";
 import {
   CookieAttrs, defaultCookieAttrs, checkCookie, setCookieValue, requestCookie,
-} from "./cookie";
-import { sessionIdHashOf } from "./authn";
+} from "../sessions";
+import { sessionIdHashOf } from "../sessions";
 import {
   hmacSha256, constantTimeEquals, base64UrlEncode, base64UrlDecode, textToBytes,
-} from "./internal/crypto";
+} from "../crypto";
 
 export type CsrfMode = CsrfTokenMode | CsrfHeaderMode(string);
 

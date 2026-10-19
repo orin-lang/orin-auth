@@ -1,0 +1,14 @@
+// Public interface of the sessions module. Implementation files are private.
+export {
+  AuthAnonymous, AuthExtras, AuthFailed, AuthOutcome, AuthPassed, Authenticator, SESSION_ATTR,
+  authenticate, noExtras, sessionAuthenticator, sessionIdHashOf,
+} from "./authn";
+export {
+  CookieAttrs, SameSite, SameSiteLax, SameSiteNone, SameSiteStrict, checkCookie, clearCookieValue,
+  defaultCookieAttrs, isCookieValue, parseCookieHeader, requestCookie, sameSiteName, setCookieValue,
+} from "./cookie";
+export {
+  MemorySessionStore, NewSession, SessionActive, SessionAnonymous, SessionConfig, SessionExpired,
+  SessionLookup, SessionManager, SessionRecord, SessionStore, checkSessionConfig,
+  defaultSessionConfig, sessionIdHash,
+} from "./session";

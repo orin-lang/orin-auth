@@ -12,9 +12,9 @@ import { Scope } from "std:task";
 import {
   Request, Response, WebError, Handler, Middleware, statusError, withErrorHeader,
 } from "orin-web";
-import { AuthError, authError, ConfigInvalid } from "./error";
-import { NowFn } from "./services";
-import { KvHandle, startKv } from "./internal/kv";
+import { AuthError, authError, ConfigInvalid } from "../core";
+import { NowFn } from "../core";
+import { KvHandle, startKv } from "../storage";
 
 export type RateLimitConfig = { capacity: int; refillEveryMs: int; maxKeys: int; };
 

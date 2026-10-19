@@ -25,8 +25,8 @@ import { Scope, Sender, Receiver, channel, spawnFs, spawnClock } from "std:task"
 import { FsGrant, File, Read, withFile } from "std:fs";
 import { ClockGrant, nowMillis } from "std:time";
 import { AuthError, authError, EntropyFailed, ServiceUnavailable, InputInvalid } from "./error";
-import { KvHandle, startKv } from "./internal/kv";
-import { sha256, textToBytes } from "./internal/crypto";
+import { KvHandle, startKv } from "../storage";
+import { sha256, textToBytes } from "../crypto";
 
 export type NowFn = () => int;
 export type RandomFn = (n: usize) => Result<Bytes, AuthError>;

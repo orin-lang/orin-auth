@@ -2,50 +2,50 @@ export {
   AuthMethod, ViaSession, ViaApiToken, ViaJwt, ViaOidc, ViaOther, Principal, authMethodName,
   newPrincipal, hasRole, hasScope, hasAnyRole, hasAllScopes, withPrincipal, withoutPrincipal,
   principalOf,
-} from "./principal";
+} from "./core";
 export {
   AuthErrorKind, ConfigInvalid, InputInvalid, EntropyFailed, ServiceUnavailable, FeatureUnsupported,
   AuthError, authError, authErrorMessage,
-} from "./error";
+} from "./core";
 export {
   SameSite, SameSiteLax, SameSiteStrict, SameSiteNone, CookieAttrs, defaultCookieAttrs,
   sameSiteName, isCookieValue, checkCookie, setCookieValue, clearCookieValue, parseCookieHeader,
   requestCookie,
-} from "./cookie";
+} from "./sessions";
 export {
   NowFn, RandomFn, ClockService, RandomService, MAX_RANDOM_REQUEST, startClock, fixedClock,
   startRandom, constantRandom, failingRandom, countingRandom,
-} from "./services";
+} from "./core";
 export {
   PasswordAlgorithm, Pbkdf2Sha256, Argon2id, PasswordPolicy, PasswordErrorKind, MalformedHash,
   UnsupportedAlgorithm, InvalidParams, PasswordTooLong, NoEntropy, PasswordError,
   passwordErrorMessage, MAX_PASSWORD_BYTES, defaultPasswordPolicy, Phc, parsePhc, hashPassword,
   verifyPassword, needsRehash, VerifyOutcome, PasswordRejected, PasswordAccepted,
   PasswordAcceptedRehashed, verifyAndUpgrade, dummyVerify,
-} from "./password";
+} from "./credentials";
 export {
   SessionRecord, SessionStore, MemorySessionStore, SessionConfig, defaultSessionConfig,
   checkSessionConfig, NewSession, SessionLookup, SessionAnonymous, SessionActive, SessionExpired,
   sessionIdHash, SessionManager,
-} from "./session";
+} from "./sessions";
 export {
   AuthExtras, AuthOutcome, AuthAnonymous, AuthPassed, AuthFailed, Authenticator, noExtras,
   SESSION_ATTR, sessionIdHashOf, sessionAuthenticator, authenticate,
-} from "./authn";
+} from "./sessions";
 export {
   DenyMode, DenyJson, DenyRedirect, DenyByAccept, AuthzConfig, defaultAuthzConfig, pagesAuthzConfig,
   mixedAuthzConfig, safeNext, requirePrincipal, requireAuthenticated, requireRole, requireAnyRole,
   requireScope, requireAllScopes, currentPrincipal,
-} from "./authz";
+} from "./protection";
 export {
   CsrfMode, CsrfTokenMode, CsrfHeaderMode, CsrfConfig, defaultCsrfConfig, CsrfProtection,
-} from "./csrf";
+} from "./protection";
 export {
   ApiTokenRecord, ApiTokenStore, MemoryApiTokenStore, TokenSpec, IssuedToken, isValidTokenPrefix,
   issueApiToken, TokenFailure, TokenMalformed, TokenUnknown, TokenWrongSecret, TokenExpired,
   TokenRevoked, TokenCheck, TokenValid, TokenInvalid, tokenFailureText, splitToken, verifyApiToken,
   revokeApiToken, apiTokenAuthenticator,
-} from "./apitoken";
+} from "./credentials";
 export {
   JwtAlg, JwtHS256, JwtRS256, JwtES256, jwtAlgName, SignatureVerifier, JwtKey, JwtSecret,
   JwtExternalKey, MIN_HMAC_KEY_BYTES, jwtSecret, jwtExternalKey, JwtErrorKind, JwtMalformed,
@@ -53,13 +53,13 @@ export {
   JwtBadSignature, JwtExpired, JwtNotYetValid, JwtWrongIssuer, JwtWrongAudience, JwtMissingClaim,
   JwtError, jwtErrorMessage, JwtOptions, defaultJwtOptions, VerifiedJwt, jsonMemberOf, claimString,
   claimStrings, claimInt, jwtClaims, signJwt, verifyJwt, jwtPrincipal, jwtAuthenticator,
-} from "./jwt";
+} from "./credentials";
 export {
   AUTHENTICATED, roleMiddlewareName, scopeMiddlewareName, authMiddlewares,
-} from "./annotated";
+} from "./protection";
 export {
   RateLimitConfig, defaultLoginLimit, Bucket, RateDecision, RateLimiter, rateLimit,
-} from "./ratelimit";
+} from "./protection";
 export {
   OidcProvider, OidcClient, OidcHttpRequest, OidcHttpResponse, OidcHttp, OidcErrorKind,
   OidcDiscoveryInvalid, OidcStateInvalid, OidcProviderError, OidcTokenExchange, OidcTokenInvalid,

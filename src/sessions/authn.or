@@ -15,8 +15,8 @@ import { QueryPair } from "std:url";
 import {
   Request, Response, WebError, Handler, Middleware, unauthorized, withErrorHeader,
 } from "orin-web";
-import { NowFn } from "./services";
-import { Principal, ViaSession, withPrincipal, withoutPrincipal } from "./principal";
+import { NowFn } from "../core";
+import { Principal, ViaSession, withPrincipal, withoutPrincipal } from "../core";
 import { SessionManager, SessionActive, SessionAnonymous, SessionExpired } from "./session";
 
 export type AuthExtras = { attrs: QueryPair[]; setCookies: string[]; };

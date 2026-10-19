@@ -3,7 +3,7 @@
 import { isToken } from "std:http";
 import { QueryPair } from "std:url";
 import { Request } from "orin-web";
-import { AuthError, authError, ConfigInvalid, InputInvalid } from "./error";
+import { AuthError, authError, ConfigInvalid, InputInvalid } from "../core";
 
 export type SameSite = SameSiteLax | SameSiteStrict | SameSiteNone;
 

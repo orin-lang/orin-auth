@@ -84,3 +84,7 @@ not-yet-valid tokens, wrong issuer / audience, `alg: none`, algorithm confusion,
 [docs/security.md](docs/security.md) has the threat model, the design choices and the known limits.
 
 MIT license.
+
+## Module architecture
+
+Implementation is organized into directory modules with explicit `module.or` interfaces and compiler-enforced dependency policies. See [the module map](docs/architecture.md) and run `ORIN=/path/to/orin tools/check_modules.sh` to verify the boundaries. The package-level imports remain compatible.

@@ -1,0 +1,15 @@
+// Public interface of the protection module. Implementation files are private.
+export {
+  AUTHENTICATED, authMiddlewares, roleMiddlewareName, scopeMiddlewareName,
+} from "./annotated";
+export {
+  AuthzConfig, DenyByAccept, DenyJson, DenyMode, DenyRedirect, currentPrincipal, defaultAuthzConfig,
+  mixedAuthzConfig, pagesAuthzConfig, requireAllScopes, requireAnyRole, requireAuthenticated,
+  requirePrincipal, requireRole, requireScope, safeNext,
+} from "./authz";
+export {
+  CsrfConfig, CsrfHeaderMode, CsrfMode, CsrfProtection, CsrfTokenMode, defaultCsrfConfig,
+} from "./csrf";
+export {
+  Bucket, RateDecision, RateLimitConfig, RateLimiter, defaultLoginLimit, rateLimit,
+} from "./ratelimit";

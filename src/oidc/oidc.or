@@ -25,18 +25,18 @@ import {
 import { PercentSpace, QueryPair, percentEncode } from "std:url";
 import { toLowerAscii } from "std:http";
 import { Scope } from "std:task";
-import { AuthError, authErrorMessage } from "./error";
-import { RandomFn } from "./services";
-import { CookieAttrs, setCookieValue } from "./cookie";
+import { AuthError, authErrorMessage } from "../core";
+import { RandomFn } from "../core";
+import { CookieAttrs, setCookieValue } from "../sessions";
 import {
   VerifiedJwt, JwtKey, JwtOptions, JwtError, JwtAlg, JwtRS256, JwtES256, SignatureVerifier,
   jwtExternalKey, verifyJwt, jwtErrorMessage, jsonMemberOf, claimString, claimStrings, claimInt,
-} from "./jwt";
-import { KvHandle, startKv } from "./internal/kv";
+} from "../credentials";
+import { KvHandle, startKv } from "../storage";
 import {
   sha256, hexEncode, base64Encode, base64UrlEncode, base64UrlDecode, constantTimeEqualsText,
   textToBytes,
-} from "./internal/crypto";
+} from "../crypto";
 
 // ------------------------------------------------------------------------------------------------------------ configuration
 

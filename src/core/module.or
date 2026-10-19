@@ -1,0 +1,14 @@
+// Public interface of the core module. Implementation files are private.
+export {
+  AuthError, AuthErrorKind, ConfigInvalid, EntropyFailed, FeatureUnsupported, InputInvalid,
+  ServiceUnavailable, authError, authErrorMessage,
+} from "./error";
+export {
+  AuthMethod, Principal, ViaApiToken, ViaJwt, ViaOidc, ViaOther, ViaSession, authMethodName,
+  hasAllScopes, hasAnyRole, hasRole, hasScope, newPrincipal, principalOf, withPrincipal,
+  withoutPrincipal,
+} from "./principal";
+export {
+  ClockService, MAX_RANDOM_REQUEST, NowFn, RandomFn, RandomService, constantRandom, countingRandom,
+  failingRandom, fixedClock, startClock, startRandom,
+} from "./services";

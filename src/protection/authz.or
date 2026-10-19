@@ -15,7 +15,7 @@ import { Method, Get, Head, toLowerAscii, methodName } from "std:http";
 import {
   Request, Response, WebError, Handler, Middleware, unauthorized, forbidden, withErrorHeader,
 } from "orin-web";
-import { Principal, principalOf, hasRole, hasScope, hasAnyRole, hasAllScopes } from "./principal";
+import { Principal, principalOf, hasRole, hasScope, hasAnyRole, hasAllScopes } from "../core";
 
 export type DenyMode = DenyJson | DenyRedirect(string) | DenyByAccept(string);
 

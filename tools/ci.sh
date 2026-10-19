@@ -6,12 +6,16 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ORIN="${ORIN:-orin}"
 
-echo "== orin-auth tests"
 "$ORIN" fetch
+
+echo "== module architecture"
+ORIN="$ORIN" tools/check_modules.sh
+
+echo "== orin-auth tests"
 "$ORIN" test
 
 echo "== internal tests (temporary crypto, key-value owner task)"
-for f in src/internal/*_test.or; do
+for f in src/crypto/*_test.or src/storage/*_test.or; do
   "$ORIN" test "$f"
 done
 

@@ -11,10 +11,10 @@ sets `Secure` on every cookie by default.
 
 ## Cryptography (read this first)
 
-`std:crypto` does not exist yet. orin-auth reaches every primitive through ONE module, `src/internal/crypto.or`, whose names
+`std:crypto` does not exist yet. orin-auth reaches every primitive through ONE module, `src/crypto/crypto.or`, whose names
 are the ones expected from `std:crypto` (`sha256`, `hmacSha256`, `pbkdf2HmacSha256`, `constantTimeEquals`, base64url). Until then that
 module contains pure-Orin implementations of the **standard algorithms only** (FIPS 180-4 SHA-256, RFC 2104 HMAC, RFC 8018 PBKDF2),
-verified against published vectors (`src/internal/crypto_test.or`); no construction of our own. Consequences:
+verified against published vectors (`src/crypto/crypto_test.or`); no construction of our own. Consequences:
 
 * **Speed.** Orin has no bitwise operators, so XOR is a 64K table lookup and rotations are divisions. One SHA-256 block takes about 12
   microseconds, one PBKDF2 iteration about 25. The default of **20,000 PBKDF2 iterations (about half a second)** is therefore below
@@ -81,7 +81,7 @@ decided after the secret is checked, so only a holder learns the reason. Scopes 
 ## JWT
 
 HS256 verification is a **verifier for tokens you or a peer service issued**, not a session replacement: JWTs cannot be revoked before they
-expire. Use short lifetimes. The checks, in order, are in the header of `src/jwt.or`; the points that matter:
+expire. Use short lifetimes. The checks, in order, are in the header of `src/credentials/jwt.or`; the points that matter:
 
 * `alg: none` is refused in any spelling, even if the application lists every algorithm. Unknown algorithms (HS384, PS256, ...) are refused.
 * **Algorithm confusion**: the verifier's allow-list AND the selected key's own algorithm must match the header; an HMAC key never verifies an

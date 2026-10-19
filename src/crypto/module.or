@@ -1,0 +1,6 @@
+// Public interface of the crypto module. Implementation files are private.
+export {
+  base64Encode, base64UrlDecode, base64UrlEncode, bytesToText, constantTimeEquals,
+  constantTimeEqualsText, hexDecode, hexEncode, hmacSha256, pbkdf2DefaultIterations,
+  pbkdf2HmacSha256, sha256, textToBytes,
+} from "./crypto";
